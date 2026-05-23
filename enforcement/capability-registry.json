@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "description": "Base registry for reusable pi-multiagent agents. Workflow packs can add pack-specific registries under enforcement/packs/<pack-name>/capability-registry.json.",
+  "owners": {
+    "readme-management": "documenter",
+    "plan-management": "documenter",
+    "arc42-documentation": "documenter",
+    "adr-management": "documenter",
+    "course-correction-adr": "documenter",
+    "asciidoc-generation": "documenter",
+    "documentation-structuring": "documenter",
+    "c4-diagram-integration": "documenter",
+    "test-report-documentation": "documenter",
+    "quality-report-documentation": "documenter",
+
+    "c4-architecture-diagrams": "c4model",
+    "structurizr-dsl": "c4model",
+    "structurizr-local": "c4model",
+    "structurizr-export": "c4model",
+    "browser-based-png-svg-export": "c4model",
+    "c4-context-view": "c4model",
+    "c4-container-view": "c4model",
+    "c4-component-view": "c4model",
+    "c4-code-view": "c4model",
+    "diagram-export": "c4model",
+    "png-generation": "c4model",
+    "svg-generation": "c4model"
+  },
+  "aliases": {
+    "arc42": "arc42-documentation",
+    "c4-architecture": "c4-architecture-diagrams"
+  },
+  "fileRules": [
+    { "pattern": "README.md", "capability": "readme-management", "owner": "documenter" },
+    { "pattern": "PLAN.md", "capability": "plan-management", "owner": "documenter" },
+    { "pattern": "docs/arc42/**", "capability": "arc42-documentation", "owner": "documenter" },
+    { "pattern": "docs/adr/**", "capability": "adr-management", "owner": "documenter" },
+    { "pattern": "docs/test-report.md", "capability": "test-report-documentation", "owner": "documenter" },
+    { "pattern": "docs/quality-report.md", "capability": "quality-report-documentation", "owner": "documenter" },
+    { "pattern": "docs/c4/**", "capability": "structurizr-dsl", "owner": "c4model" }
+  ],
+  "sharedOwnership": {
+    "PLAN.md": {
+      "contentSource": "workflow-planner",
+      "fileWriter": "documenter"
+    },
+    "docs/test-report.md": {
+      "contentSource": "workflow-tester",
+      "fileWriter": "documenter"
+    }
+  }
+}

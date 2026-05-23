@@ -1,19 +1,10 @@
 # Agents directory
 
-Install workflow packs into this directory.
+The base `pi-multiagent` skill ships only generic reusable agents:
 
-The base `pi-multiagent` skill intentionally ships without domain-specific agents. Agent capability definitions are provided by separate workflow packs, for example:
+- `documenter`
+- `c4model`
 
-```text
-workflow/pi-java-multiagent/agents/
-```
-
-After installing a workflow pack, this directory should contain files such as:
-
-```text
-java-planner.md
-java-scaffolder.md
-...
-```
+Workflow packs install domain-specific agents into this same directory, for example Java, Tauri, web, or service agents.
 
 All installed agent definitions must write generated project artifacts in English.

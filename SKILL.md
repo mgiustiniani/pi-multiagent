@@ -2,9 +2,9 @@
 name: multi-agent
 description: >
   Multi-Agent System Framework (MASF). Define hierarchical agent workflows with
-  strict delegation enforcement. Agents are capability units; workflows decide
-  the primary agent, sub-agents, and delegation hierarchy. When a workflow is
-  active, the system MUST use only that workflow. Execution is strictly sequential.
+  strict sequential delegation. Agents are capability units; workflows decide
+  primary agents, sub-agents, and delegation hierarchy. Workflow packs can add
+  custom agents, workflows, and capability ownership rules.
 ---
 
 # Multi-Agent System Framework (MASF)
@@ -12,47 +12,42 @@ description: >
 MASF is a framework for defining and executing hierarchical, workflow-bound,
 sequentially delegated agent systems.
 
-This base skill contains the framework, enforcement rules, the TUI status
-extension, and shared operational tooling. Concrete agents and workflows are
-installed as separate workflow packs.
+This base skill contains the generic framework, enforcement rules, the TUI status
+extension, and the `delegate_agent` runtime tool. Concrete workflow-specific agents and workflows are installed as workflow packs. The base skill ships reusable `documenter` and `c4model` agents so workflow packs can share documentation and C4 behavior.
 
 ## Core Principles
 
-1. **Workflow Binding** — When a workflow is active, the system MUST exclusively use that workflow.
-2. **Workflow-Defined Hierarchy** — Agents are capability units. The workflow decides which agent is primary and which agents are delegated children.
-3. **Forced Delegation** — A parent agent CANNOT execute a task that falls within a child agent's capabilities. Delegation is mandatory.
-4. **Sequential Execution** — Agents NEVER run in parallel. One agent completes before the next executes.
+1. **Workflow Binding** — When a workflow is active, the system MUST use that workflow.
+2. **Workflow-Defined Hierarchy** — Agents are capability units; workflows define parent-child relationships.
+3. **Forced Delegation** — A parent agent cannot execute a task that a child owns.
+4. **Sequential Execution** — Agents never run in parallel.
 5. **Recursive Propagation** — Delegation propagates down the workflow-defined hierarchy.
-6. **English-Only Generated Text** — All agents MUST write generated code comments, documentation, ADRs, README content, ARC42 content, plans, test reports, C4 descriptions, examples, and user-facing tool messages in English.
+6. **English-Only Generated Artifacts** — Generated code comments, documentation, plans, reports, diagrams, and user-facing artifact text are written in English.
 
 ## Directory Layout
 
 ```text
 multi-agent/
 ├── SKILL.md
-├── agents/                     # Installed agent capability definitions
+├── agents/                     # Generic base agents + installed pack agents
+│   ├── documenter.md
+│   └── c4model.md
 ├── workflows/                  # Installed workflow definitions
+├── docs/
+│   └── custom-agents-and-workflows.md
 ├── enforcement/
+│   ├── capability-registry.json
 │   ├── delegation-rules.md
-│   └── validator.md
+│   ├── validator.md
+│   └── packs/                  # Workflow pack registry fragments
 ├── extensions/
 │   └── multi-agent-status-panel.ts
-├── tools/                      # Skill-owned operational tools
-│   ├── c4model-local.sh
-│   ├── c4model-validate.sh
-│   ├── c4model-export.sh
-│   ├── c4model-export-static.sh
-│   ├── c4model-export-images.sh
-│   └── c4model-build-structurizr.sh
+├── tools/                      # Generic C4/Structurizr tooling used by c4model
 └── templates/
     └── c4/
-        └── structurizr.properties
 ```
 
 ## Agent Definition Format
-
-Agent files live in `agents/` and define capabilities only. They do not define
-hierarchy.
 
 ```yaml
 ---
@@ -64,9 +59,9 @@ capabilities:
 ---
 ```
 
-## Workflow Definition Format
+Agents define capabilities only. They do not define hierarchy.
 
-Workflow files live in `workflows/` and define the hierarchy.
+## Workflow Definition Format
 
 ```yaml
 ---
@@ -79,40 +74,33 @@ agents:
 hierarchy:
   - agent: primary-agent
     children:
-      - child-agent
+      - agent: child-agent
 strict: true
 sequential: true
 ---
 ```
 
-## Global Language Policy
+Workflows define hierarchy and delegation structure.
 
-All installed agents and workflows MUST follow this policy:
+## Workflow Pack Ownership Rules
 
-- Generated documentation MUST be written in English.
-- Generated source-code comments and Javadocs MUST be written in English.
-- Generated ADRs, README content, ARC42 content, plans, test reports, C4 descriptions, examples, and user-facing messages MUST be written in English.
-- Preserve non-English text only when quoting an existing source verbatim or when an external term intentionally requires it.
-- If the user writes in another language, conversational replies may use that language, but generated project artifacts remain English-only.
+The base registry is:
 
-## Skill-Owned C4 Tooling
+```text
+enforcement/capability-registry.json
+```
 
-The base skill owns Structurizr operational tooling so repositories do not need
-to duplicate C4 workflow logic.
+Workflow packs should install registry fragments under:
 
-- `tools/c4model-local.sh` starts Structurizr local with Podman or Docker.
-- `tools/c4model-validate.sh` validates a Structurizr workspace.
-- `tools/c4model-export.sh` runs the official Structurizr export command.
-- `tools/c4model-export-static.sh` exports a static Structurizr site.
-- `tools/c4model-export-images.sh` exports PNG/SVG through Structurizr's browser-based renderer.
-- `tools/c4model-build-structurizr.sh` builds the open-source Structurizr WAR when PNG/SVG support is required.
-- `templates/c4/structurizr.properties` is the default Structurizr local configuration.
+```text
+enforcement/packs/<pack-name>/capability-registry.json
+```
 
-Project-level scripts may exist as thin wrappers around these skill-owned tools.
+The extension merges all registries dynamically.
 
-## Commands
+## Activation Commands
 
-```bash
+```text
 /skill:multi-agent activate <workflow-name>
 /skill:multi-agent list
 /skill:multi-agent status
@@ -121,11 +109,19 @@ Project-level scripts may exist as thin wrappers around these skill-owned tools.
 
 ## Extension
 
-The optional TUI widget extension is:
+Load the extension to enable the status panel, validator, project-local workflow state, and `delegate_agent`:
 
-```text
-extensions/multi-agent-status-panel.ts
+```bash
+pi --skill ~/.pi/agent/skills/multi-agent \
+   --extension ~/.pi/agent/skills/multi-agent/extensions/multi-agent-status-panel.ts
 ```
 
-It discovers installed agents/workflows dynamically and shows the current active
-workflow and active agent.
+The extension stores active workflow state in the project:
+
+```text
+.pi/multi-agent/active-workflow.yml
+```
+
+## Extending the Framework
+
+See `docs/custom-agents-and-workflows.md`.

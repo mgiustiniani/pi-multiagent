@@ -1,77 +1,53 @@
 ---
 name: validator
 type: enforcement
-description: Validator agent that enforces all delegation rules in the multi-agent system.
+description: Generic validator behavior implemented by the multi-agent extension.
 ---
 
 # Validator
 
-## Global Output Language
-All generated artifacts, source-code comments, documentation, ADRs, plans, reports, C4 descriptions, examples, and user-facing messages produced by this agent/workflow MUST be written in English. Preserve non-English text only when quoting an existing source verbatim or when an external term intentionally requires it.
+The validator is implemented in `extensions/multi-agent-status-panel.ts` through Pi's `tool_call` event.
 
+When a workflow is active, it:
 
-The validator intercepts every delegation decision and checks it against the active workflow and delegation rules.
+1. Loads the active workflow from project-local state: `.pi/multi-agent/active-workflow.yml`.
+2. Falls back to the legacy skill-local `.active-workflow` only for compatibility.
+3. Discovers agents and workflows dynamically from `agents/` and `workflows/`.
+4. Loads capability/path ownership from:
+   - `enforcement/capability-registry.json`
+   - `enforcement/packs/*/capability-registry.json`
+5. Blocks invalid mutating tool calls.
+6. Blocks parallel tool batches while a workflow is active.
+7. Provides `delegate_agent` for sequential direct-child delegation.
 
-## Validation Process
+If no workflow is active, no delegation enforcement applies.
 
-```
-For each task T and each agent A selected to handle T:
+## Workflow Pack Registries
 
-1. LOAD active workflow W
-2. LOAD A's position in W's hierarchy
-3. LOAD A's children from W's hierarchy
-4. CHECK:
-   a. Does any child Ci have T in its capabilities?
-   b. If YES → A MUST delegate. Did A delegate? 
-         └─ YES → OK, pass to Ci and recurse
-         └─ NO  → VIOLATION: "A executed task that Ci should handle"
-   c. If NO → A MAY execute. Did A execute?
-         └─ YES → OK
-         └─ NO  → VIOLATION: "A delegated but no child can handle T"
-```
+Workflow packs should install registry fragments under:
 
-## Validation Checks
-
-### Check 1: Workflow Compliance
-- Is the active workflow being used? → NO = BLOCK
-- Is another workflow being used? → BLOCK
-- Is no workflow active but tasks are being processed? → BLOCK
-
-### Check 2: Hierarchy Compliance
-- Does the delegation follow the workflow's hierarchy tree?
-- Are parent-child relationships from the workflow respected?
-- Are agents being used that are not in the workflow? → BLOCK
-
-### Check 3: Delegation Compliance
-- Did a parent execute a child's task? → BLOCK
-- Did a parent fail to delegate when a child could handle? → BLOCK
-- Did a child receive a task it cannot handle? → delegate back or escalate
-
-### Check 4: Sequential Compliance
-- Are any two agents running simultaneously? → BLOCK
-- Did a parent proceed before child completed? → BLOCK
-
-### Check 5: Boundary Compliance
-- Is delegation depth respected? (if max depth = 3, 4 levels = BLOCK)
-- Are circular delegations detected? → BLOCK
-
-## Reporting Format
-
-```
-═══ VALIDATION REPORT ═══
-Status: ✅ PASS | ❌ BLOCKED
-Workflow: <name>
-Violation: <description>
-Agent: <name>
-Task: <description>
-Suggested Fix: <correct action>
-════════════════════════
+```text
+enforcement/packs/<pack-name>/capability-registry.json
 ```
 
-## Integration
+This keeps the base framework generic while allowing packs to define concrete ownership rules.
 
-The validator is invoked:
-- Before any agent executes a task
-- After delegation decisions
-- When results bubble back up
-- On workflow activation/deactivation
+## Delegation Tool
+
+The extension registers:
+
+```text
+delegate_agent(agent, task, cwd?)
+```
+
+Rules:
+
+- The target agent must be part of the active workflow.
+- The target agent must be a direct child of the current agent.
+- Deeper delegation must go through intermediate agents.
+- The delegated agent runs in an isolated `pi` process.
+- Execution remains sequential.
+
+## Dynamic Extension
+
+The validator supports newly added agents and workflows without code changes as long as their frontmatter is valid and ownership rules are provided where mechanical classification is required.

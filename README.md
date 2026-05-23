@@ -6,21 +6,22 @@ It provides:
 
 - workflow-bound hierarchical delegation rules;
 - sequential execution constraints;
-- validator/enforcement documentation;
+- dynamic discovery of agents and workflows;
+- reusable generic agents: `documenter` and `c4model`;
+- generic C4/Structurizr tooling used by `c4model`;
+- a validator/runtime extension with `delegate_agent`;
 - a TUI status panel extension;
-- shared C4/Structurizr operational tooling;
-- an English-only generated-artifact policy.
+- a generic capability registry that workflow packs can extend.
 
-It does **not** include project-specific agents or workflows. Install workflow packs after installing this base skill.
+It does **not** include Java-specific implementation agents or the `full-development` workflow. Install workflow packs after installing this base skill.
 
 ## Install in pi
 
-From the repository root:
+From this repository root:
 
 ```bash
-mkdir -p ~/.pi/agent/skills
-rm -rf ~/.pi/agent/skills/multi-agent
-cp -R pi-multiagent ~/.pi/agent/skills/multi-agent
+mkdir -p ~/.pi/agent/skills/multi-agent
+rsync -a --delete --exclude .git ./ ~/.pi/agent/skills/multi-agent/
 ```
 
 Verify:
@@ -33,7 +34,8 @@ Expected files/directories include:
 
 ```text
 SKILL.md
-agents/
+agents/documenter.md
+agents/c4model.md
 workflows/
 enforcement/
 extensions/
@@ -41,7 +43,7 @@ tools/
 templates/
 ```
 
-## Optional: enable the TUI status panel
+## Enable the TUI status panel and validator
 
 Start pi with the extension:
 
@@ -63,34 +65,57 @@ Or add the extension to your pi settings:
 
 ## Install a workflow pack
 
-After installing this base skill, install a workflow pack such as:
+Example Java workflow pack:
+
+```bash
+cd ~/workspace/pi-java-multiagent
+./scripts/install.sh
+```
+
+Uninstall it with:
+
+```bash
+cd ~/workspace/pi-java-multiagent
+./scripts/uninstall.sh
+```
+
+## Workflow pack registry fragments
+
+Workflow packs can install ownership rules under:
 
 ```text
-workflow/pi-java-multiagent
+enforcement/packs/<pack-name>/capability-registry.json
 ```
+
+The base extension merges these fragments dynamically.
+
+## Commands
+
+Inside pi:
+
+```text
+/skill:multi-agent activate <workflow-name>
+/skill:multi-agent list
+/skill:multi-agent status
+/skill:multi-agent deactivate
+```
+
+## Custom agents and workflows
 
 See:
 
 ```text
-workflow/pi-java-multiagent/README.md
+docs/custom-agents-and-workflows.md
 ```
-
-## Update an existing installation
-
-```bash
-rsync -a --delete pi-multiagent/ ~/.pi/agent/skills/multi-agent/
-```
-
-Then reinstall any workflow packs, because `--delete` removes pack-provided agents and workflows.
 
 ## English-only generated artifacts
 
-The base skill enforces that all installed agents and workflows generate project artifacts in English, including:
+The base policy is that installed agents and workflows generate project artifacts in English, including:
 
 - source-code comments and Javadocs;
 - README/PLAN/ARC42/ADR documentation;
 - C4 diagram descriptions;
 - test reports;
-- user-facing generated messages.
+- user-facing generated artifact text.
 
 Conversational replies may use the user's language, but generated project files remain English-only.

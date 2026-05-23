@@ -16,13 +16,18 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { basename, dirname, join, relative, resolve } from "node:path";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 
 interface AgentInfo {
   name: string;
   description: string;
+  capabilities: string[];
+  filePath: string;
   emoji: string;
 }
 
@@ -45,7 +50,23 @@ const EXTENSION_FILE = typeof __filename !== "undefined" ? __filename : fileURLT
 const SKILL_DIR = resolve(dirname(EXTENSION_FILE), "..");
 const AGENTS_DIR = join(SKILL_DIR, "agents");
 const WORKFLOWS_DIR = join(SKILL_DIR, "workflows");
-const ACTIVE_WORKFLOW_FILE = join(SKILL_DIR, ".active-workflow");
+const LEGACY_ACTIVE_WORKFLOW_FILE = join(SKILL_DIR, ".active-workflow");
+const CAPABILITY_REGISTRY_FILE = join(SKILL_DIR, "enforcement", "capability-registry.json");
+const FORCED_AGENT = process.env.MULTI_AGENT_AGENT || null;
+
+interface CapabilityRegistry {
+  owners?: Record<string, string>;
+  aliases?: Record<string, string>;
+  fileRules?: Array<{ pattern: string; capability?: string; owner: string }>;
+  sharedOwnership?: Record<string, Record<string, string>>;
+}
+
+interface Classification {
+  capability: string;
+  owner: string;
+  reason: string;
+  allowedOwners?: string[];
+}
 
 const DEFAULT_EMOJIS: Record<string, string> = {
   "java-planner": "🏗️",
@@ -139,13 +160,15 @@ function loadAgents(): AgentInfo[] {
   if (!existsSync(AGENTS_DIR)) return [];
 
   return readdirSync(AGENTS_DIR)
-    .filter((file) => file.endsWith(".md") && !file.endsWith("index.md"))
+    .filter((file) => file.endsWith(".md") && !file.endsWith("index.md") && file !== "README.md")
     .map((file) => {
       const content = readFileSync(join(AGENTS_DIR, file), "utf8");
       const fm = readFrontmatter(content);
+      const filePath = join(AGENTS_DIR, file);
       const name = parseScalar(fm, "name") || basename(file, ".md");
       const description = parseScalar(fm, "description") || "Agent";
-      return { name, description, emoji: DEFAULT_EMOJIS[name] || "🤖" };
+      const capabilities = parseList(fm, "capabilities");
+      return { name, description, capabilities, filePath, emoji: DEFAULT_EMOJIS[name] || "🤖" };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -154,7 +177,7 @@ function loadWorkflows(): WorkflowInfo[] {
   if (!existsSync(WORKFLOWS_DIR)) return [];
 
   return readdirSync(WORKFLOWS_DIR)
-    .filter((file) => file.endsWith(".md") && !file.endsWith("index.md"))
+    .filter((file) => file.endsWith(".md") && !file.endsWith("index.md") && file !== "README.md")
     .map((file) => {
       const filePath = join(WORKFLOWS_DIR, file);
       const content = readFileSync(filePath, "utf8");
@@ -168,44 +191,93 @@ function loadWorkflows(): WorkflowInfo[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function parseActiveWorkflowFile(): { workflow: string | null; active: boolean } {
-  if (!existsSync(ACTIVE_WORKFLOW_FILE)) return { workflow: null, active: false };
+function readActiveWorkflowFile(filePath: string): { workflow: string | null; active: boolean } | null {
+  if (!existsSync(filePath)) return null;
 
-  const content = readFileSync(ACTIVE_WORKFLOW_FILE, "utf8");
+  const content = readFileSync(filePath, "utf8");
   const workflow = content.match(/^workflow:\s*(\S+)/m)?.[1] || null;
   const status = content.match(/^status:\s*(\S+)/m)?.[1] || "inactive";
   return { workflow, active: status === "active" && Boolean(workflow) };
 }
 
-function persistActiveWorkflow(workflowName: string): void {
-  writeFileSync(
-    ACTIVE_WORKFLOW_FILE,
-    `workflow: ${workflowName}\nactivated_at: ${new Date().toISOString()}\nstatus: active\n`,
-    "utf8",
-  );
+function projectActiveWorkflowFile(cwd: string): string {
+  return join(cwd, ".pi", "multi-agent", "active-workflow.yml");
 }
 
-function persistInactiveWorkflow(lastWorkflow: string | null): void {
-  writeFileSync(
-    ACTIVE_WORKFLOW_FILE,
-    `workflow: ${lastWorkflow || ""}\ndeactivated_at: ${new Date().toISOString()}\nstatus: inactive\n`,
-    "utf8",
-  );
+function parseActiveWorkflowFile(cwd: string): { workflow: string | null; active: boolean } {
+  return readActiveWorkflowFile(projectActiveWorkflowFile(cwd))
+    || readActiveWorkflowFile(LEGACY_ACTIVE_WORKFLOW_FILE)
+    || { workflow: null, active: false };
+}
+
+function persistActiveWorkflow(cwd: string, workflowName: string): void {
+  const content = `workflow: ${workflowName}\nproject: ${cwd}\nactivated_at: ${new Date().toISOString()}\nstatus: active\n`;
+  const projectFile = projectActiveWorkflowFile(cwd);
+  mkdirSync(dirname(projectFile), { recursive: true });
+  writeFileSync(projectFile, content, "utf8");
+  writeFileSync(LEGACY_ACTIVE_WORKFLOW_FILE, content, "utf8");
+}
+
+function persistInactiveWorkflow(cwd: string, lastWorkflow: string | null): void {
+  const content = `workflow: ${lastWorkflow || ""}\nproject: ${cwd}\ndeactivated_at: ${new Date().toISOString()}\nstatus: inactive\n`;
+  const projectFile = projectActiveWorkflowFile(cwd);
+  mkdirSync(dirname(projectFile), { recursive: true });
+  writeFileSync(projectFile, content, "utf8");
+  writeFileSync(LEGACY_ACTIVE_WORKFLOW_FILE, content, "utf8");
+}
+
+function mergeCapabilityRegistry(target: CapabilityRegistry, source: CapabilityRegistry): CapabilityRegistry {
+  target.owners = { ...(target.owners || {}), ...(source.owners || {}) };
+  target.aliases = { ...(target.aliases || {}), ...(source.aliases || {}) };
+  target.fileRules = [...(target.fileRules || []), ...(source.fileRules || [])];
+  target.sharedOwnership = { ...(target.sharedOwnership || {}), ...(source.sharedOwnership || {}) };
+  return target;
+}
+
+function readCapabilityRegistry(filePath: string): CapabilityRegistry {
+  if (!existsSync(filePath)) return {};
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8")) as CapabilityRegistry;
+  } catch {
+    return {};
+  }
+}
+
+function loadCapabilityRegistry(): CapabilityRegistry {
+  const merged: CapabilityRegistry = {};
+  mergeCapabilityRegistry(merged, readCapabilityRegistry(CAPABILITY_REGISTRY_FILE));
+
+  const packsDir = join(SKILL_DIR, "enforcement", "packs");
+  if (existsSync(packsDir)) {
+    for (const packName of readdirSync(packsDir).sort()) {
+      mergeCapabilityRegistry(merged, readCapabilityRegistry(join(packsDir, packName, "capability-registry.json")));
+    }
+  }
+
+  return merged;
 }
 
 export default function (pi: ExtensionAPI) {
   let agents: AgentInfo[] = [];
   let workflows: WorkflowInfo[] = [];
+  let registry: CapabilityRegistry = {};
+  let currentCwd = process.cwd();
   let workflowActive = false;
   let activeWorkflowName: string | null = null;
   let currentAgent: string | null = null;
   let currentMode: AgentMode | null = null;
   let currentTask: string | null = null;
   let forceWorkflowList = false;
+  let autoCompactTriggered = false;
 
   function refreshResources(): void {
     agents = loadAgents();
     workflows = loadWorkflows();
+    registry = loadCapabilityRegistry();
+  }
+
+  function setCwd(ctx: any): void {
+    if (typeof ctx?.cwd === "string" && ctx.cwd) currentCwd = ctx.cwd;
   }
 
   function getAgent(agentName: string): AgentInfo | undefined {
@@ -261,7 +333,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function refreshActiveStateFromDisk(): void {
-    const active = parseActiveWorkflowFile();
+    const active = parseActiveWorkflowFile(currentCwd);
     workflowActive = active.active;
     activeWorkflowName = active.active ? active.workflow : null;
 
@@ -273,6 +345,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     const workflow = getWorkflow(activeWorkflowName);
+    if (FORCED_AGENT && workflowUsesAgent(workflow, FORCED_AGENT)) {
+      currentAgent = FORCED_AGENT;
+      currentMode = isRootAgent(workflow, FORCED_AGENT) ? "primary" : "delegated";
+      return;
+    }
+
     if (!currentAgent || !workflowUsesAgent(workflow, currentAgent)) {
       currentAgent = primaryAgent(workflow);
       currentMode = currentAgent ? "primary" : null;
@@ -289,7 +367,7 @@ export default function (pi: ExtensionAPI) {
     currentAgent = primaryAgent(workflow);
     currentMode = currentAgent ? "primary" : null;
     currentTask = task;
-    persistActiveWorkflow(workflow.name);
+    persistActiveWorkflow(currentCwd, workflow.name);
     return true;
   }
 
@@ -301,12 +379,18 @@ export default function (pi: ExtensionAPI) {
     currentAgent = null;
     currentMode = null;
     currentTask = null;
-    persistInactiveWorkflow(lastWorkflow);
+    autoCompactTriggered = false;
+    persistInactiveWorkflow(currentCwd, lastWorkflow);
   }
 
   function normalizeAgentCandidate(value: string | undefined): string | null {
     if (!value) return null;
-    const cleaned = value.replace(/[\]})>,.:;]+$/g, "").replace(/^[\[({<]+/g, "");
+    // Strip markdown bold/italic, backticks, quotes, and trailing punctuation
+    var cleaned = value
+      .replace(/[*_`~]+/g, '')
+      .replace(/^['"`\[({<]+/g, '')
+      .replace(/[\]})>,.:;]+$/g, '')
+      .trim();
     return agents.some((agent) => agent.name === cleaned) ? cleaned : null;
   }
 
@@ -347,49 +431,244 @@ export default function (pi: ExtensionAPI) {
     return true;
   }
 
+  function findNode(nodes: AgentNode[], name: string): AgentNode | null {
+    for (const node of nodes) {
+      if (node.name === name) return node;
+      const found = findNode(node.children, name);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function getParentMap(workflow: WorkflowInfo | undefined): Map<string, string | null> {
+    const parents = new Map<string, string | null>();
+    if (!workflow) return parents;
+    const visit = (nodes: AgentNode[], parent: string | null) => {
+      for (const node of nodes) {
+        parents.set(node.name, parent);
+        visit(node.children, node.name);
+      }
+    };
+    visit(workflow.hierarchy, null);
+    return parents;
+  }
+
+  function isDirectChild(workflow: WorkflowInfo | undefined, parent: string, child: string): boolean {
+    return Boolean(findNode(workflow?.hierarchy || [], parent)?.children.some((node) => node.name === child));
+  }
+
+  function delegationPath(workflow: WorkflowInfo | undefined, from: string, to: string): string[] {
+    const parents = getParentMap(workflow);
+    const path = [to];
+    let cur = to;
+    while (parents.has(cur)) {
+      const parent = parents.get(cur);
+      if (!parent) break;
+      path.unshift(parent);
+      if (parent === from) return path;
+      cur = parent;
+    }
+    return path.includes(from) ? path.slice(path.indexOf(from)) : path;
+  }
+
+  function activeAgentName(): string | null {
+    const workflow = getWorkflow();
+    return FORCED_AGENT || currentAgent || primaryAgent(workflow);
+  }
+
+  function normalizeCapability(capability: string): string {
+    return registry.aliases?.[capability] || capability;
+  }
+
+  function ownerForCapability(capability: string): string | null {
+    const canonical = normalizeCapability(capability);
+    const fromRegistry = registry.owners?.[canonical];
+    if (fromRegistry) return fromRegistry;
+    return agents.find((agent) => agent.capabilities.includes(canonical))?.name || null;
+  }
+
+  function toProjectRelative(filePath: string): string {
+    const absolute = resolve(currentCwd, filePath);
+    const rel = relative(currentCwd, absolute).replace(/\\/g, "/");
+    return rel.startsWith("..") ? filePath.replace(/\\/g, "/") : rel;
+  }
+
+  function globLikeMatch(pattern: string, relPath: string): boolean {
+    const compile = (p: string) => {
+      const token = "__DOUBLE_STAR__";
+      const esc = p
+        .replace(/\*\*/g, token)
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*/g, "[^/]*")
+        .replace(new RegExp(token, "g"), ".*");
+      return new RegExp(`^${esc}$`);
+    };
+    if (compile(pattern).test(relPath)) return true;
+    if (pattern.startsWith("**/")) return compile(pattern.slice(3)).test(relPath);
+    return false;
+  }
+
+  function classifyJavaImports(filePath: string): Classification | null {
+    if (!existsSync(filePath)) return null;
+    let content = "";
+    try { content = readFileSync(filePath, "utf8"); } catch { return null; }
+    const scan = content.split(/\r?\n/).slice(0, 200).join("\n");
+    if (/import\s+(org\.springframework|reactor\.|tools\.jackson\.)/.test(scan)) {
+      return { capability: "infrastructure-code-generation", owner: "java-infra-coder", reason: "Java framework import scan" };
+    }
+    if (/import\s+(io\.cucumber|org\.junit\.)/.test(scan)) {
+      return { capability: "integration-test-setup", owner: "java-tester", reason: "Java test import scan" };
+    }
+    return null;
+  }
+
+  function classifyPath(filePath: string): Classification | null {
+    const relPath = toProjectRelative(filePath);
+    const absPath = resolve(currentCwd, filePath);
+    const normalized = relPath.replace(/^\.\//, "");
+
+    if (normalized.endsWith(".java")) {
+      const importClass = classifyJavaImports(absPath);
+      if (importClass) return importClass;
+    }
+
+    if (normalized === "docs/test-report.md") {
+      return { capability: "test-report-documentation", owner: "documenter", allowedOwners: ["documenter", "java-tester"], reason: "shared test report ownership" };
+    }
+
+    for (const rule of registry.fileRules || []) {
+      if (globLikeMatch(rule.pattern, normalized)) {
+        return { capability: rule.capability || "file-mutation", owner: rule.owner, reason: `file rule ${rule.pattern}` };
+      }
+    }
+
+    if (normalized === "README.md") return { capability: "readme-management", owner: "documenter", reason: "README ownership" };
+    if (normalized === "PLAN.md") return { capability: "plan-management", owner: "documenter", reason: "PLAN ownership" };
+    if (normalized.startsWith("docs/c4/")) return { capability: "structurizr-dsl", owner: "c4model", reason: "C4 documentation path" };
+    if (normalized.startsWith("docs/arc42/") || normalized.startsWith("docs/adr/")) return { capability: "arc42-documentation", owner: "documenter", reason: "documentation path" };
+    if (basename(normalized) === "pom.xml") return { capability: "pom-generation", owner: "java-scaffolder", reason: "Maven POM" };
+    if (normalized.includes("-domain/")) return { capability: "domain-code-generation", owner: "java-domain-coder", reason: "domain module path" };
+    if (normalized.includes("-application/") || normalized.includes("-infrastructure/") || normalized.startsWith("s3-api/") || normalized.startsWith("bootstrap-application/")) {
+      return { capability: "application-code-generation", owner: "java-infra-coder", reason: "application/infrastructure module path" };
+    }
+    if (normalized.endsWith(".feature")) return { capability: "gherkin-feature-writing", owner: "java-tester", reason: "Gherkin feature" };
+    if (/Test\.java$|Steps\.java$/.test(normalized)) return { capability: "integration-test-setup", owner: "java-tester", reason: "test Java file name" };
+    if (basename(normalized) === "test-aws-cli.sh") return { capability: "aws-cli-compatibility-tests", owner: "java-tester", reason: "AWS CLI test script" };
+    return null;
+  }
+
+  function classifyBash(command: string): Classification | null {
+    if (/c4model-|structurizr|docs\/c4\//.test(command)) return { capability: "structurizr-export", owner: "c4model", reason: "C4/Structurizr command" };
+    if (/\b(test-aws-cli\.sh|cucumber|surefire|clover:|mvn\s+.*\btest\b)/.test(command)) return { capability: "integration-test-setup", owner: "java-tester", reason: "test command" };
+    if (/\bpom\.xml\b|mvn\s+archetype|mvn\s+-N/.test(command)) return { capability: "pom-generation", owner: "java-scaffolder", reason: "Maven scaffolding command" };
+    return null;
+  }
+
+  function isMutationTool(toolName: string): boolean {
+    return ["write", "edit", "bash"].some((name) => toolName === name || toolName.endsWith(`.${name}`));
+  }
+
+  function validationForClassification(classification: Classification, toolLabel: string): string | null {
+    if (!workflowActive) return null;
+    const workflow = getWorkflow();
+    if (!workflow) return null;
+    if (!workflowUsesAgent(workflow, classification.owner)) return null;
+    const agent = activeAgentName();
+    if (!agent) return null;
+    if (classification.allowedOwners?.includes(agent) || agent === classification.owner) return null;
+
+    const path = delegationPath(workflow, agent, classification.owner).join(" → ");
+    return [
+      "Multi-agent validation blocked this tool call.",
+      `Current agent: ${agent}`,
+      `Required owner: ${classification.owner}`,
+      `Capability: ${classification.capability}`,
+      `Reason: ${classification.reason}`,
+      `Tool: ${toolLabel}`,
+      `Suggested delegation: ${path || `${agent} → ${classification.owner}`}`,
+    ].join("\n");
+  }
+
+  function validateToolUse(toolName: string, input: any): string | null {
+    if (!workflowActive) return null;
+    if (toolName === "multi_tool_use.parallel" || toolName.endsWith(".parallel")) {
+      const count = Array.isArray(input?.tool_uses) ? input.tool_uses.length : 0;
+      if (count > 1) return "Multi-agent validation blocked parallel tool execution while a workflow is active. Execute delegated work sequentially.";
+    }
+    if (toolName === "delegate_agent" || toolName.endsWith(".delegate_agent")) return null;
+
+    if (toolName === "write" || toolName.endsWith(".write") || toolName === "edit" || toolName.endsWith(".edit")) {
+      const filePath = input?.path;
+      if (typeof filePath === "string") {
+        const classification = classifyPath(filePath);
+        if (classification) return validationForClassification(classification, `${toolName} ${filePath}`);
+      }
+    }
+
+    if (toolName === "bash" || toolName.endsWith(".bash")) {
+      const command = input?.command;
+      if (typeof command === "string") {
+        const classification = classifyBash(command);
+        if (classification) return validationForClassification(classification, `${toolName} ${command.slice(0, 80)}`);
+      }
+    }
+
+    if (Array.isArray(input?.tool_uses)) {
+      for (const use of input.tool_uses) {
+        const nested = validateToolUse(String(use?.recipient_name || use?.toolName || ""), use?.parameters || {});
+        if (nested) return nested;
+      }
+    }
+
+    return null;
+  }
+
   function parseStatusFromText(text: string): { agent: string; task: string | null } | null {
-    const delegLine = text.match(/(?:Delegating|Delega|Delego)[:\s]+(\S+)\s*(?:→|->|to|a)\s*(\S+)/i);
+    // Strip markdown formatting before matching
+    var plain = text.replace(/[*_`~]+/g, '');
+
+    const delegLine = plain.match(/(?:Delegating|Delega|Delego)[:\s]+(\S+)\s*(?:\u2192|->|to|a)\s*(\S+)/i);
     if (delegLine) {
       const delegated = normalizeAgentCandidate(delegLine[2]);
       if (delegated) return { agent: delegated, task: null };
     }
 
-    const delegToLine = text.match(/(?:Delegating\s+to|Delego\s+a|Delega\s+a)\s+(\S+)/i);
+    const delegToLine = plain.match(/(?:Delegating\s+to|Delego\s+a|Delega\s+a)\s+(\S+)/i);
     if (delegToLine) {
       const delegated = normalizeAgentCandidate(delegToLine[1]);
       if (delegated) return { agent: delegated, task: null };
     }
 
-    const backLine = text.match(/(?:back\s+to|ritorno\s+a)\s*(\S+)/i);
+    const backLine = plain.match(/(?:back\s+to|ritorno\s+a)\s*(\S+)/i);
     if (backLine) {
       const parent = normalizeAgentCandidate(backLine[1]);
       if (parent) return { agent: parent, task: null };
     }
 
-    const agentLine = text.match(/\b(?:AGENT|Agent|agente)\s*:\s*(\S+)/i);
+    const agentLine = plain.match(/\b(?:AGENT|Agent|agente)\s*:\s*(\S+)/i);
     if (agentLine) {
       const agent = normalizeAgentCandidate(agentLine[1]);
       if (agent) {
-        const task = text.match(/\b(?:TASK|Task|task)\s*:\s*(.+)/)?.[1]?.trim() || null;
+        const task = plain.match(/\b(?:TASK|Task|task)\s*:\s*(.+)/)?.[1]?.trim() || null;
         return { agent, task };
       }
     }
 
-    const doneLine = text.match(/✓\s*(\S+)\s*completed/i);
+    const doneLine = plain.match(/\u2713\s*(\S+)\s*completed/i);
     if (doneLine) {
       const agent = normalizeAgentCandidate(doneLine[1]);
-      if (agent) return { agent, task: "completed" };
+      if (agent) return { agent, task: 'completed' };
     }
 
-    const failLine = text.match(/✗\s*(\S+)\s*FAILED:?\s*(.*)/i);
+    const failLine = plain.match(/\u2717\s*(\S+)\s*FAILED:?\s*(.*)/i);
     if (failLine) {
       const agent = normalizeAgentCandidate(failLine[1]);
-      if (agent) return { agent, task: failLine[2] ? `FAILED: ${failLine[2]}` : "FAILED" };
+      if (agent) return { agent, task: failLine[2] ? `FAILED: ${failLine[2]}` : 'FAILED' };
     }
 
     for (const agent of agents) {
-      const bracket = new RegExp(`\\[${agent.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\]`);
-      if (bracket.test(text)) return { agent: agent.name, task: null };
+      const bracket = new RegExp(`\\[${agent.name.replace(/[.*+?^${}()|[\]\\]/g, "\\\$&")}\\]`);
+      if (bracket.test(plain)) return { agent: agent.name, task: null };
     }
 
     return null;
@@ -419,7 +698,7 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
   }
 
-  function renderTree(workflow: WorkflowInfo | undefined, nodes: AgentNode[], theme: any, prefix = "", root = true): string[] {
+  function renderTree(workflow: WorkflowInfo | undefined, nodes: AgentNode[], theme: any, width: number, prefix = "", root = true): string[] {
     const lines: string[] = [];
 
     nodes.forEach((node, index) => {
@@ -432,31 +711,32 @@ export default function (pi: ExtensionAPI) {
       const label = `${getEmoji(node.name)} ${node.name}`;
       const suffix = active ? theme.fg("success", `  ← ACTIVE [${role}]`) : theme.fg("dim", `  [${role}]`);
 
-      lines.push(`${prefix}${connector}${color(label)}${suffix}`);
-      lines.push(...renderTree(workflow, node.children, theme, `${prefix}${continuation}`, false));
+      const line = `${prefix}${connector}${color(label)}${suffix}`;
+      lines.push(truncateToWidth(line, width));
+      lines.push(...renderTree(workflow, node.children, theme, width, `${prefix}${continuation}`, false));
     });
 
     return lines;
   }
 
-  function buildLines(theme: any): string[] {
+  function buildLines(theme: any, width: number): string[] {
     if (workflowActive && !forceWorkflowList) {
       const workflow = getWorkflow();
       const workflowName = workflow?.name || activeWorkflowName || "unknown";
       const task = currentTask ? theme.fg("dim", ` — ${currentTask}`) : "";
       const lines = [
-        `${theme.fg("success", "● Multi-Agent active")} ${theme.fg("accent", workflowName)}${task}`,
+        truncateToWidth(`${theme.fg("success", "● Multi-Agent active")} ${theme.fg("accent", workflowName)}${task}`, width),
       ];
 
-      if (workflow?.hierarchy.length) lines.push(...renderTree(workflow, workflow.hierarchy, theme, "  "));
+      if (workflow?.hierarchy.length) lines.push(...renderTree(workflow, workflow.hierarchy, theme, width, "  "));
       else if (workflow?.agents.length) {
         for (const agent of workflow.agents) {
           const active = agent === currentAgent;
           const color = active ? (t: string) => theme.fg("success", t) : agentColor(agent, theme);
-          lines.push(`  ${color(`${getEmoji(agent)} ${agent}`)}${active ? theme.fg("success", "  ← ACTIVE") : ""}`);
+          lines.push(truncateToWidth(`  ${color(`${getEmoji(agent)} ${agent}`)}${active ? theme.fg("success", "  ← ACTIVE") : ""}`, width));
         }
       } else {
-        lines.push(theme.fg("warning", "  Workflow senza agenti definiti"));
+        lines.push(truncateToWidth(theme.fg("warning", "  Workflow has no defined agents"), width));
       }
 
       return lines;
@@ -464,24 +744,25 @@ export default function (pi: ExtensionAPI) {
 
     const lines = workflowActive && forceWorkflowList
       ? [
-          `${theme.fg("success", "● Multi-Agent active")} ${theme.fg("accent", activeWorkflowName || "unknown")} ${theme.fg("dim", "— workflow disponibili")}`,
-          theme.fg("dim", "  Cambia con: /skill:multi-agent activate <workflow>"),
+          truncateToWidth(`${theme.fg("success", "● Multi-Agent active")} ${theme.fg("accent", activeWorkflowName || "unknown")} ${theme.fg("dim", "— available workflows")}`, width),
+          truncateToWidth(theme.fg("dim", "  Change with: /skill:multi-agent activate <workflow>"), width),
         ]
       : [
-          theme.fg("dim", "○ Multi-Agent: no active workflow"),
-          theme.fg("dim", "  Activate with: /skill:multi-agent activate <workflow>"),
+          truncateToWidth(theme.fg("dim", "○ Multi-Agent: no active workflow"), width),
+          truncateToWidth(theme.fg("dim", "  Activate with: /skill:multi-agent activate <workflow>"), width),
         ];
 
     if (workflows.length === 0) {
-      lines.push(theme.fg("warning", "  Nessun workflow trovato in workflows/"));
+      lines.push(truncateToWidth(theme.fg("warning", "  No workflow found in workflows/"), width));
       return lines;
     }
 
     for (const workflow of workflows) {
-      lines.push(`${theme.fg("accent", `  ${workflow.name}`)} ${theme.fg("dim", `— ${workflow.description}`)}`);
-      if (workflow.hierarchy.length) lines.push(...renderTree(workflow, workflow.hierarchy, theme, "    "));
-      else if (workflow.agents.length) lines.push(theme.fg("dim", `    agents: ${workflow.agents.join(", ")}`));
-      else lines.push(theme.fg("warning", "    no agents defined"));
+      const desc = truncateToWidth(workflow.description, Math.max(width - visibleWidth(`  ${workflow.name} — `), 10));
+      lines.push(truncateToWidth(`${theme.fg("accent", `  ${workflow.name}`)} ${theme.fg("dim", `— ${desc}`)}`, width));
+      if (workflow.hierarchy.length) lines.push(...renderTree(workflow, workflow.hierarchy, theme, width, "    "));
+      else if (workflow.agents.length) lines.push(truncateToWidth(theme.fg("dim", `    agents: ${workflow.agents.join(", ")}`), width));
+      else lines.push(truncateToWidth(theme.fg("warning", "    no agents defined"), width));
     }
 
     return lines;
@@ -491,20 +772,139 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
 
     ctx.ui.setWidget("multi-agent-status", (_tui: any, theme: any) => ({
-      render: () => buildLines(theme),
+      render: (width: number) => buildLines(theme, width),
       invalidate: () => {},
     }), { placement: "belowEditor" });
   }
 
   function refreshAndUpdate(ctx: any): void {
+    setCwd(ctx);
     refreshResources();
     refreshActiveStateFromDisk();
     updateWidget(ctx);
   }
 
+  function getPiInvocation(args: string[]): { command: string; args: string[] } {
+    const currentScript = process.argv[1];
+    if (currentScript && existsSync(currentScript) && !currentScript.startsWith("/$bunfs/root/")) {
+      return { command: process.execPath, args: [currentScript, ...args] };
+    }
+    const executable = basename(process.execPath).toLowerCase();
+    if (/^(node|bun)(\.exe)?$/.test(executable)) return { command: "pi", args };
+    return { command: process.execPath, args };
+  }
+
+  async function runDelegatedAgent(agentName: string, task: string, cwd: string, signal?: AbortSignal): Promise<{ output: string; stderr: string; exitCode: number }> {
+    const agent = getAgent(agentName);
+    if (!agent) throw new Error(`Unknown delegated agent: ${agentName}`);
+
+    const args = [
+      "--mode", "json",
+      "-p",
+      "--no-session",
+      "--skill", SKILL_DIR,
+      "--extension", EXTENSION_FILE,
+      "--append-system-prompt", agent.filePath,
+      `Delegated agent: ${agentName}\n\nTask:\n${task}`,
+    ];
+
+    const invocation = getPiInvocation(args);
+    return await new Promise((resolvePromise, reject) => {
+      const proc = spawn(invocation.command, invocation.args, {
+        cwd,
+        shell: false,
+        env: { ...process.env, MULTI_AGENT_AGENT: agentName, MULTI_AGENT_PARENT: activeAgentName() || "" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let finalOutput = "";
+      let buffer = "";
+
+      const processLine = (line: string) => {
+        if (!line.trim()) return;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "message_end" && event.message?.role === "assistant") {
+            const text = event.message.content?.find?.((part: any) => part?.type === "text")?.text;
+            if (typeof text === "string") finalOutput = text;
+          }
+        } catch {
+          /* Ignore non-JSON output. */
+        }
+      };
+
+      proc.stdout.on("data", (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+        buffer += text;
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) processLine(line);
+      });
+      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      proc.on("error", reject);
+      proc.on("close", (code) => {
+        if (buffer.trim()) processLine(buffer);
+        resolvePromise({ output: finalOutput || stdout.trim() || "(no output)", stderr, exitCode: code ?? 0 });
+      });
+
+      const abort = () => {
+        proc.kill("SIGTERM");
+        setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  pi.registerTool({
+    name: "delegate_agent",
+    label: "Delegate Agent",
+    description: "Delegate work to a direct child agent from the active multi-agent workflow. Runs the child in an isolated pi process and preserves sequential execution.",
+    promptSnippet: "Delegate work to a direct child agent in the active multi-agent workflow.",
+    promptGuidelines: [
+      "Use delegate_agent whenever the active multi-agent workflow says a child agent owns the task capability.",
+      "delegate_agent may only target direct children of the current workflow agent; delegate through intermediate agents for deeper tasks.",
+    ],
+    parameters: Type.Object({
+      agent: Type.String({ description: "Direct child agent to invoke" }),
+      task: Type.String({ description: "Task description for the delegated agent" }),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the delegated pi process" })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      setCwd(ctx);
+      refreshResources();
+      refreshActiveStateFromDisk();
+      const workflow = getWorkflow();
+      const from = activeAgentName() || primaryAgent(workflow);
+
+      if (workflowActive && workflow && from) {
+        if (!workflowUsesAgent(workflow, params.agent)) throw new Error(`Agent ${params.agent} is not part of workflow ${workflow.name}.`);
+        if (!isDirectChild(workflow, from, params.agent)) {
+          const path = delegationPath(workflow, from, params.agent).join(" → ");
+          throw new Error(`Invalid delegation: ${from} can delegate only to direct children. Use path: ${path || `${from} → ${params.agent}`}.`);
+        }
+      }
+
+      const previousAgent = currentAgent;
+      setCurrentAgent(params.agent, params.task.slice(0, 80));
+      const result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, signal);
+      if (previousAgent) setCurrentAgent(previousAgent);
+
+      if (result.exitCode !== 0) throw new Error(`Delegated agent ${params.agent} failed with exit code ${result.exitCode}: ${result.stderr || result.output}`);
+      return {
+        content: [{ type: "text", text: result.output }],
+        details: { agent: params.agent, task: params.task, stderr: result.stderr, exitCode: result.exitCode },
+      };
+    },
+  });
+
   // ── Commands exposed through the documented /skill:multi-agent syntax ──
 
   pi.on("input", async (event, ctx) => {
+    setCwd(ctx);
     const match = event.text.trim().match(/^\/skill:multi-agent(?:\s+(\S+))?(?:\s+(.+))?$/);
     if (!match) return { action: "continue" as const };
 
@@ -515,30 +915,32 @@ export default function (pi: ExtensionAPI) {
 
     if (command === "activate") {
       if (!args) {
-        ctx.ui.notify("Uso: /skill:multi-agent activate <workflow>", "error");
+        ctx.ui.notify("Usage: /skill:multi-agent activate <workflow>", "error");
         return { action: "handled" as const };
       }
       if (!activateWorkflow(args, "activated")) {
-        ctx.ui.notify(`Workflow non trovato: ${args}`, "error");
+        ctx.ui.notify(`Workflow not found: ${args}`, "error");
         updateWidget(ctx);
         return { action: "handled" as const };
       }
       ctx.ui.notify(`Active workflow: ${args}`, "info");
       updateWidget(ctx);
-      return { action: "handled" as const };
+      // Let pi expand the skill command so the agent receives SKILL.md content
+      return { action: "continue" as const };
     }
 
     if (command === "deactivate") {
       deactivateWorkflow();
-      ctx.ui.notify("Workflow multi-agent disattivato", "info");
+      ctx.ui.notify("Multi-agent workflow deactivated", "info");
       updateWidget(ctx);
-      return { action: "handled" as const };
+      // Let pi expand the skill command so the agent receives updated context
+      return { action: "continue" as const };
     }
 
     if (command === "list") {
       forceWorkflowList = true;
       updateWidget(ctx);
-      ctx.ui.notify(`${workflows.length} workflow disponibili`, "info");
+      ctx.ui.notify(`${workflows.length} workflows available`, "info");
       return { action: "handled" as const };
     }
 
@@ -549,7 +951,7 @@ export default function (pi: ExtensionAPI) {
       return { action: "handled" as const };
     }
 
-    ctx.ui.notify(`Comando multi-agent sconosciuto: ${command}`, "error");
+    ctx.ui.notify(`Unknown multi-agent command: ${command}`, "error");
     return { action: "handled" as const };
   });
 
@@ -560,6 +962,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    setCwd(ctx);
     refreshResources();
     refreshActiveStateFromDisk();
 
@@ -567,7 +970,7 @@ export default function (pi: ExtensionAPI) {
       forceWorkflowList = false;
       const workflow = getWorkflow();
       const primary = primaryAgent(workflow);
-      if (primary) {
+      if (primary && !FORCED_AGENT) {
         currentAgent = primary;
         currentMode = "primary";
         currentTask = typeof event.prompt === "string" ? event.prompt.slice(0, 80) : null;
@@ -577,9 +980,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!ctx.hasUI) return;
+    setCwd(ctx);
     refreshResources();
     refreshActiveStateFromDisk();
+
+    const blockReason = validateToolUse(event.toolName, event.input);
+    if (blockReason) return { block: true, reason: blockReason };
+
+    if (!ctx.hasUI) return;
     if (!workflowActive) {
       forceWorkflowList = false;
       updateWidget(ctx);
@@ -596,6 +1004,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    setCwd(ctx);
     if (!ctx.hasUI) return;
 
     const text = toolResultText(event);
@@ -607,6 +1016,7 @@ export default function (pi: ExtensionAPI) {
       currentAgent = null;
       currentMode = null;
       currentTask = null;
+      autoCompactTriggered = false;
       updateWidget(ctx);
       return;
     }
@@ -616,6 +1026,19 @@ export default function (pi: ExtensionAPI) {
 
     if (event.toolName === "write" || event.toolName === "edit" || event.toolName?.endsWith(".write") || event.toolName?.endsWith(".edit")) {
       refreshResources();
+
+      // Auto-compact: detect PLAN.md writes and trigger compaction
+      const filePath = typeof event.input?.path === "string" ? event.input.path : "";
+      const fileName = basename(filePath.replace(/\\/g, "/"));
+      if (workflowActive && (fileName === "PLAN.md" || fileName === "plan.md" || filePath.endsWith("/PLAN.md") || filePath.endsWith("/plan.md"))) {
+        if (!autoCompactTriggered) {
+          autoCompactTriggered = true;
+          ctx.ui.notify("PLAN.md written — triggering auto-compact", "info");
+          ctx.compact({
+            customInstructions: "Compact session after PLAN.md update for course correction",
+          });
+        }
+      }
     }
 
     const parsed = parseStatusFromText(text);
@@ -624,6 +1047,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event, ctx) => {
+    setCwd(ctx);
     if (!ctx.hasUI || event.message?.role !== "assistant") return;
 
     refreshResources();
