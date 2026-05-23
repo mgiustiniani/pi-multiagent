@@ -102,8 +102,10 @@ The extension merges all registries dynamically.
 
 ```text
 /skill:multi-agent activate <workflow-name>
-/skill:multi-agent list
-/skill:multi-agent status
+/skill:multi-agent status      # compact status panel
+/skill:multi-agent list        # compact workflow list, no trees
+/skill:multi-agent detail      # detailed active tree / workflow details
+/skill:multi-agent compact     # return panel to compact mode
 /skill:multi-agent deactivate
 ```
 
@@ -116,10 +118,13 @@ pi --skill ~/.pi/agent/skills/multi-agent \
    --extension ~/.pi/agent/skills/multi-agent/extensions/multi-agent-status-panel.ts
 ```
 
-The extension stores active workflow state in the project:
+The extension stores active workflow state in the current pi session by default. Different sessions can therefore use different active workflows.
 
-```text
-.pi/multi-agent/active-workflow.yml
+Optional compatibility modes:
+
+```bash
+MULTI_AGENT_STATE_SCOPE=project   # store/read .pi/multi-agent/active-workflow.yml
+MULTI_AGENT_STATE_SCOPE=legacy    # store/read the old skill-local .active-workflow
 ```
 
 ## Extending the Framework

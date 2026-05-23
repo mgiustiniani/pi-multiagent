@@ -79,6 +79,17 @@ cd ~/workspace/pi-java-multiagent
 ./scripts/uninstall.sh
 ```
 
+## Status panel layout
+
+The TUI widget is split into two side-by-side blocks on wide terminals:
+
+- **Workflow**: active workflow, agent chain, compact/list/detail views.
+- **Agent Activity**: live delegated-agent activity counters and last operation.
+
+The activity block is UI-only metadata. It does not stream child-agent tool output into the main model context.
+
+On narrow terminals the blocks stack vertically.
+
 ## Workflow pack registry fragments
 
 Workflow packs can install ownership rules under:
@@ -89,14 +100,29 @@ enforcement/packs/<pack-name>/capability-registry.json
 
 The base extension merges these fragments dynamically.
 
+## Workflow state scope
+
+By default, active workflow state is **session-scoped**. Different pi sessions can use different active workflows even in the same project directory.
+
+For special cases, set:
+
+```bash
+MULTI_AGENT_STATE_SCOPE=project   # share active workflow through .pi/multi-agent/active-workflow.yml
+MULTI_AGENT_STATE_SCOPE=legacy    # use the old skill-local .active-workflow file
+```
+
+Session scope is recommended because it prevents a workflow activated in one session from leaking into another.
+
 ## Commands
 
 Inside pi:
 
 ```text
 /skill:multi-agent activate <workflow-name>
-/skill:multi-agent list
-/skill:multi-agent status
+/skill:multi-agent status      # compact panel
+/skill:multi-agent list        # workflow list without trees
+/skill:multi-agent detail      # detailed active tree / workflow details
+/skill:multi-agent compact     # return to compact panel
 /skill:multi-agent deactivate
 ```
 
