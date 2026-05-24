@@ -60,10 +60,27 @@ const MAX_COMPACT_WORKFLOWS = Number(process.env.MULTI_AGENT_MAX_COMPACT_WORKFLO
 const MAX_WIDGET_LINES = Number(process.env.MULTI_AGENT_MAX_WIDGET_LINES || 12);
 const WORKFLOW_STATE_ENTRY = "multi-agent-workflow-state";
 
+interface CapabilityFileRule {
+  pattern: string;
+  capability?: string;
+  owner: string;
+  workflows?: string[];
+  allowedOwners?: string[];
+  reason?: string;
+}
+
+interface CapabilityDenyRule {
+  pattern: string;
+  workflows?: string[];
+  capability?: string;
+  reason?: string;
+}
+
 interface CapabilityRegistry {
   owners?: Record<string, string>;
   aliases?: Record<string, string>;
-  fileRules?: Array<{ pattern: string; capability?: string; owner: string }>;
+  fileRules?: CapabilityFileRule[];
+  denyRules?: CapabilityDenyRule[];
   sharedOwnership?: Record<string, Record<string, string>>;
 }
 
@@ -259,6 +276,7 @@ function mergeCapabilityRegistry(target: CapabilityRegistry, source: CapabilityR
   target.owners = { ...(target.owners || {}), ...(source.owners || {}) };
   target.aliases = { ...(target.aliases || {}), ...(source.aliases || {}) };
   target.fileRules = [...(target.fileRules || []), ...(source.fileRules || [])];
+  target.denyRules = [...(target.denyRules || []), ...(source.denyRules || [])];
   target.sharedOwnership = { ...(target.sharedOwnership || {}), ...(source.sharedOwnership || {}) };
   return target;
 }
@@ -295,6 +313,10 @@ export default function (pi: ExtensionAPI) {
   let workflowActive = false;
   let activeWorkflowName: string | null = null;
   let currentAgent: string | null = null;
+  // Agent that owns the current process turn for enforcement/delegation.
+  // currentAgent is allowed to move for UI display while a child is running;
+  // executionAgent must remain the parent/orchestrator in the parent process.
+  let executionAgent: string | null = null;
   let currentMode: AgentMode | null = null;
   let currentTask: string | null = null;
   let forceWorkflowList = false;
@@ -402,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 
     if (!workflowActive) {
       currentAgent = null;
+      executionAgent = null;
       currentMode = null;
       currentTask = null;
       return;
@@ -410,13 +433,17 @@ export default function (pi: ExtensionAPI) {
     const workflow = getWorkflow(activeWorkflowName);
     if (FORCED_AGENT && workflowUsesAgent(workflow, FORCED_AGENT)) {
       currentAgent = FORCED_AGENT;
+      executionAgent = FORCED_AGENT;
       currentMode = isRootAgent(workflow, FORCED_AGENT) ? "primary" : "delegated";
       return;
     }
 
+    const primary = primaryAgent(workflow);
+    if (!executionAgent || !workflowUsesAgent(workflow, executionAgent)) executionAgent = primary;
+
     if (!currentAgent || !workflowUsesAgent(workflow, currentAgent)) {
-      currentAgent = primaryAgent(workflow);
-      currentMode = currentAgent ? "primary" : null;
+      currentAgent = executionAgent || primary;
+      currentMode = currentAgent ? (isRootAgent(workflow, currentAgent) ? "primary" : "delegated") : null;
     }
   }
 
@@ -428,6 +455,7 @@ export default function (pi: ExtensionAPI) {
     workflowActive = true;
     activeWorkflowName = workflow.name;
     currentAgent = primaryAgent(workflow);
+    executionAgent = currentAgent;
     currentMode = currentAgent ? "primary" : null;
     currentTask = task;
     appendSessionWorkflowState(workflow.name, "active");
@@ -441,6 +469,7 @@ export default function (pi: ExtensionAPI) {
     workflowActive = false;
     activeWorkflowName = null;
     currentAgent = null;
+    executionAgent = null;
     currentMode = null;
     currentTask = null;
     autoCompactTriggered = false;
@@ -467,6 +496,10 @@ export default function (pi: ExtensionAPI) {
 
   function isReadTool(toolName: string): boolean {
     return toolName === "read" || toolName.endsWith(".read");
+  }
+
+  function isDelegateAgentTool(toolName: string | undefined): boolean {
+    return Boolean(toolName && (toolName === "delegate_agent" || toolName.endsWith(".delegate_agent")));
   }
 
   function collectReadPaths(toolName: string, input: any): string[] {
@@ -522,6 +555,11 @@ export default function (pi: ExtensionAPI) {
     return Boolean(findNode(workflow?.hierarchy || [], parent)?.children.some((node) => node.name === child));
   }
 
+  function directChildNames(workflow: WorkflowInfo | undefined, parent: string | null): string[] {
+    if (!parent) return [];
+    return findNode(workflow?.hierarchy || [], parent)?.children.map((node) => node.name) || [];
+  }
+
   function delegationPath(workflow: WorkflowInfo | undefined, from: string, to: string): string[] {
     const parents = getParentMap(workflow);
     const path = [to];
@@ -538,7 +576,8 @@ export default function (pi: ExtensionAPI) {
 
   function activeAgentName(): string | null {
     const workflow = getWorkflow();
-    return FORCED_AGENT || currentAgent || primaryAgent(workflow);
+    if (FORCED_AGENT && workflowUsesAgent(workflow, FORCED_AGENT)) return FORCED_AGENT;
+    return executionAgent || primaryAgent(workflow) || currentAgent;
   }
 
   function normalizeCapability(capability: string): string {
@@ -573,64 +612,152 @@ export default function (pi: ExtensionAPI) {
     return false;
   }
 
-  function classifyJavaImports(filePath: string): Classification | null {
-    if (!existsSync(filePath)) return null;
-    let content = "";
-    try { content = readFileSync(filePath, "utf8"); } catch { return null; }
-    const scan = content.split(/\r?\n/).slice(0, 200).join("\n");
-    if (/import\s+(org\.springframework|reactor\.|tools\.jackson\.)/.test(scan)) {
-      return { capability: "infrastructure-code-generation", owner: "java-infra-coder", reason: "Java framework import scan" };
+  function workflowAllowsOwner(owner: string): boolean {
+    const workflow = getWorkflow();
+    if (!workflowActive || !workflow) return true;
+    return workflowUsesAgent(workflow, owner);
+  }
+
+  function ruleAppliesToActiveWorkflow(rule: { workflows?: string[] }): boolean {
+    if (!rule.workflows?.length) return true;
+    return Boolean(activeWorkflowName && rule.workflows.includes(activeWorkflowName));
+  }
+
+  function fileRuleSpecificity(pattern: string): number {
+    const withoutGlobs = pattern.replace(/\*\*/g, "").replace(/\*/g, "");
+    const slashCount = (pattern.match(/\//g) || []).length;
+    const literalChars = withoutGlobs.replace(/[{}()[\]\\.+?^$|]/g, "").length;
+    return literalChars + slashCount * 8 - (pattern.match(/\*/g) || []).length * 3;
+  }
+
+  function sharedAllowedOwners(normalizedPath: string): string[] {
+    const shared = registry.sharedOwnership?.[normalizedPath];
+    if (!shared) return [];
+    const names = new Set<string>();
+    for (const value of Object.values(shared)) {
+      if (typeof value === "string" && agents.some((agent) => agent.name === value)) names.add(value);
     }
-    if (/import\s+(io\.cucumber|org\.junit\.)/.test(scan)) {
-      return { capability: "integration-test-setup", owner: "java-tester", reason: "Java test import scan" };
-    }
-    return null;
+    return Array.from(names);
   }
 
   function classifyPath(filePath: string): Classification | null {
     const relPath = toProjectRelative(filePath);
-    const absPath = resolve(currentCwd, filePath);
     const normalized = relPath.replace(/^\.\//, "");
+    const candidates: Array<{ rule: CapabilityFileRule; score: number; workflowOwner: boolean; index: number }> = [];
 
-    if (normalized.endsWith(".java")) {
-      const importClass = classifyJavaImports(absPath);
-      if (importClass) return importClass;
-    }
+    (registry.fileRules || []).forEach((rule, index) => {
+      if (!ruleAppliesToActiveWorkflow(rule)) return;
+      if (!globLikeMatch(rule.pattern, normalized)) return;
+      candidates.push({
+        rule,
+        score: fileRuleSpecificity(rule.pattern),
+        workflowOwner: workflowAllowsOwner(rule.owner),
+        index,
+      });
+    });
 
-    if (normalized === "docs/test-report.md") {
-      return { capability: "test-report-documentation", owner: "documenter", allowedOwners: ["documenter", "java-tester"], reason: "shared test report ownership" };
-    }
+    if (candidates.length === 0) return null;
 
-    for (const rule of registry.fileRules || []) {
-      if (globLikeMatch(rule.pattern, normalized)) {
-        return { capability: rule.capability || "file-mutation", owner: rule.owner, reason: `file rule ${rule.pattern}` };
-      }
-    }
+    candidates.sort((a, b) => {
+      if (a.workflowOwner !== b.workflowOwner) return a.workflowOwner ? -1 : 1;
+      if (a.score !== b.score) return b.score - a.score;
+      return a.index - b.index;
+    });
 
-    if (normalized === "README.md") return { capability: "readme-management", owner: "documenter", reason: "README ownership" };
-    if (normalized === "PLAN.md") return { capability: "plan-management", owner: "documenter", reason: "PLAN ownership" };
-    if (normalized.startsWith("docs/c4/")) return { capability: "structurizr-dsl", owner: "c4model", reason: "C4 documentation path" };
-    if (normalized.startsWith("docs/arc42/") || normalized.startsWith("docs/adr/")) return { capability: "arc42-documentation", owner: "documenter", reason: "documentation path" };
-    if (basename(normalized) === "pom.xml") return { capability: "pom-generation", owner: "java-scaffolder", reason: "Maven POM" };
-    if (normalized.includes("-domain/")) return { capability: "domain-code-generation", owner: "java-domain-coder", reason: "domain module path" };
-    if (normalized.includes("-application/") || normalized.includes("-infrastructure/") || normalized.startsWith("s3-api/") || normalized.startsWith("bootstrap-application/")) {
-      return { capability: "application-code-generation", owner: "java-infra-coder", reason: "application/infrastructure module path" };
-    }
-    if (normalized.endsWith(".feature")) return { capability: "gherkin-feature-writing", owner: "java-tester", reason: "Gherkin feature" };
-    if (/Test\.java$|Steps\.java$/.test(normalized)) return { capability: "integration-test-setup", owner: "java-tester", reason: "test Java file name" };
-    if (basename(normalized) === "test-aws-cli.sh") return { capability: "aws-cli-compatibility-tests", owner: "java-tester", reason: "AWS CLI test script" };
-    return null;
+    const rule = candidates[0].rule;
+    const allowedOwners = Array.from(new Set([...(rule.allowedOwners || []), ...sharedAllowedOwners(normalized)]));
+    return {
+      capability: rule.capability || "file-mutation",
+      owner: rule.owner,
+      allowedOwners: allowedOwners.length ? allowedOwners : undefined,
+      reason: rule.reason || `file rule ${rule.pattern}`,
+    };
   }
 
   function classifyBash(command: string): Classification | null {
     if (/c4model-|structurizr|docs\/c4\//.test(command)) return { capability: "structurizr-export", owner: "c4model", reason: "C4/Structurizr command" };
-    if (/\b(test-aws-cli\.sh|cucumber|surefire|clover:|mvn\s+.*\btest\b)/.test(command)) return { capability: "integration-test-setup", owner: "java-tester", reason: "test command" };
-    if (/\bpom\.xml\b|mvn\s+archetype|mvn\s+-N/.test(command)) return { capability: "pom-generation", owner: "java-scaffolder", reason: "Maven scaffolding command" };
     return null;
+  }
+
+  function cleanShellPathToken(token: string): string | null {
+    let cleaned = token.trim().replace(/^['"]|['"]$/g, "");
+    cleaned = cleaned.replace(/[;,|&)]*$/g, "");
+    if (!cleaned || cleaned.startsWith("-") || cleaned.startsWith("$") || /^[A-Z_][A-Z0-9_]*=/.test(cleaned)) return null;
+    if (/^[a-z]+:\/\//i.test(cleaned)) return null;
+    if (cleaned === "." || cleaned === ".." || cleaned === "~") return null;
+    return cleaned;
+  }
+
+  function looksLikeProjectPath(token: string): boolean {
+    const base = basename(token.replace(/\\/g, "/"));
+    if (token.startsWith("./") || token.startsWith("../") || token.includes("/")) return true;
+    if (/^(README|PLAN|Makefile|CMakeLists)\.?(md|txt|json)?$/i.test(base)) return true;
+    if (/^(package|pnpm-workspace|tsconfig|CMakePresets|meson\.build)$/i.test(base)) return true;
+    return /\.(c|h|cc|cpp|cxx|hh|hpp|hxx|m|mm|cu|cuh|hip|metal|java|kt|rs|ts|tsx|js|jsx|vue|svelte|json|yaml|yml|toml|xml|feature|sh|md|adoc|onnx|ort|gguf|safetensors|mlmodel)$/i.test(base);
+  }
+
+  function bashMayMutateFiles(command: string): boolean {
+    if (/(?:^|\s)(?:>|>>|<>|2>|2>>|&>|&>>)\s*[^\s;&|]+/.test(command)) return true;
+    if (/\b(touch|mkdir|rm|rmdir|cp|mv|install|tee|truncate|chmod|chown)\b/.test(command)) return true;
+    if (/\b(sed|perl)\b[^\n;|&]*\s-(?:[^\s]*i|[^\s]*pi)\b/.test(command)) return true;
+    if (/\b(python3?|node|bun)\b[\s\S]*(writeFile|appendFile|createWriteStream|open\([^)]*["'][wa])/.test(command)) return true;
+    return false;
+  }
+
+  function extractBashPathCandidates(command: string): string[] {
+    const paths = new Set<string>();
+    const add = (raw: string | undefined) => {
+      if (!raw) return;
+      const cleaned = cleanShellPathToken(raw);
+      if (cleaned && looksLikeProjectPath(cleaned)) paths.add(cleaned);
+    };
+
+    const redirection = /(?:^|\s)(?:>|>>|<>|<|2>|2>>|&>|&>>)\s*([^\s;&|]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = redirection.exec(command))) add(match[1]);
+
+    const tokenized = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+    const pathArgCommands = new Set(["touch", "mkdir", "rm", "rmdir", "cp", "mv", "install", "tee", "truncate", "chmod", "chown"]);
+    for (let i = 0; i < tokenized.length; i++) {
+      const token = cleanShellPathToken(tokenized[i]);
+      if (!token) continue;
+      if (pathArgCommands.has(token)) {
+        for (let j = i + 1; j < tokenized.length; j++) {
+          const next = cleanShellPathToken(tokenized[j]);
+          if (!next || next.startsWith("-")) continue;
+          if (/^(&&|\|\||;|\|)$/.test(next)) break;
+          add(next);
+        }
+      } else {
+        add(token);
+      }
+    }
+
+    return Array.from(paths);
   }
 
   function isMutationTool(toolName: string): boolean {
     return ["write", "edit", "bash"].some((name) => toolName === name || toolName.endsWith(`.${name}`));
+  }
+
+  function validationForDeniedPath(filePath: string, toolLabel: string): string | null {
+    if (!workflowActive || !activeWorkflowName) return null;
+    const normalized = toProjectRelative(filePath).replace(/^\.\//, "");
+
+    for (const rule of registry.denyRules || []) {
+      if (!ruleAppliesToActiveWorkflow(rule)) continue;
+      if (!globLikeMatch(rule.pattern, normalized)) continue;
+      return [
+        "Multi-agent validation blocked this tool call.",
+        `Workflow: ${activeWorkflowName}`,
+        `Denied path: ${normalized}`,
+        `Capability: ${rule.capability || "workflow-path-deny"}`,
+        `Reason: ${rule.reason || `deny rule ${rule.pattern}`}`,
+        `Tool: ${toolLabel}`,
+      ].join("\n");
+    }
+
+    return null;
   }
 
   function validationForClassification(classification: Classification, toolLabel: string): string | null {
@@ -660,11 +787,13 @@ export default function (pi: ExtensionAPI) {
       const count = Array.isArray(input?.tool_uses) ? input.tool_uses.length : 0;
       if (count > 1) return "Multi-agent validation blocked parallel tool execution while a workflow is active. Execute delegated work sequentially.";
     }
-    if (toolName === "delegate_agent" || toolName.endsWith(".delegate_agent")) return null;
+    if (isDelegateAgentTool(toolName)) return null;
 
     if (toolName === "write" || toolName.endsWith(".write") || toolName === "edit" || toolName.endsWith(".edit")) {
       const filePath = input?.path;
       if (typeof filePath === "string") {
+        const denied = validationForDeniedPath(filePath, `${toolName} ${filePath}`);
+        if (denied) return denied;
         const classification = classifyPath(filePath);
         if (classification) return validationForClassification(classification, `${toolName} ${filePath}`);
       }
@@ -673,8 +802,20 @@ export default function (pi: ExtensionAPI) {
     if (toolName === "bash" || toolName.endsWith(".bash")) {
       const command = input?.command;
       if (typeof command === "string") {
+        const toolLabel = `${toolName} ${command.slice(0, 80)}`;
+        if (bashMayMutateFiles(command)) {
+          for (const filePath of extractBashPathCandidates(command)) {
+            const denied = validationForDeniedPath(filePath, `${toolName} ${filePath}`);
+            if (denied) return denied;
+            const pathClassification = classifyPath(filePath);
+            if (pathClassification) {
+              const pathBlock = validationForClassification(pathClassification, `${toolName} ${filePath}`);
+              if (pathBlock) return pathBlock;
+            }
+          }
+        }
         const classification = classifyBash(command);
-        if (classification) return validationForClassification(classification, `${toolName} ${command.slice(0, 80)}`);
+        if (classification) return validationForClassification(classification, toolLabel);
       }
     }
 
@@ -987,7 +1128,7 @@ export default function (pi: ExtensionAPI) {
     return { command: process.execPath, args };
   }
 
-  async function runDelegatedAgent(agentName: string, task: string, cwd: string, signal: AbortSignal | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number }> {
+  async function runDelegatedAgent(agentName: string, task: string, cwd: string, parentAgent: string | null, signal: AbortSignal | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number }> {
     const agent = getAgent(agentName);
     if (!agent) throw new Error(`Unknown delegated agent: ${agentName}`);
 
@@ -1006,7 +1147,7 @@ export default function (pi: ExtensionAPI) {
       const proc = spawn(invocation.command, invocation.args, {
         cwd,
         shell: false,
-        env: { ...process.env, MULTI_AGENT_AGENT: agentName, MULTI_AGENT_PARENT: activeAgentName() || "", MULTI_AGENT_WORKFLOW: activeWorkflowName || "" },
+        env: { ...process.env, MULTI_AGENT_AGENT: agentName, MULTI_AGENT_PARENT: parentAgent || "", MULTI_AGENT_WORKFLOW: activeWorkflowName || "" },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -1039,13 +1180,28 @@ export default function (pi: ExtensionAPI) {
 
       proc.stdout.on("data", (chunk) => {
         const text = chunk.toString();
-        stdout += text;
+        // Prevent RangeError: Invalid string length by capping accumulators.
+        if (stdout.length > 500_000) {
+          stdout = stdout.slice(-250_000) + text.slice(-250_000);
+        } else {
+          stdout += text;
+        }
         buffer += text;
+        if (buffer.length > 500_000) {
+          buffer = buffer.slice(-500_000);
+        }
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
         for (const line of lines) processLine(line);
       });
-      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      proc.stderr.on("data", (chunk) => {
+        const t = chunk.toString();
+        if (stderr.length > 500_000) {
+          stderr = stderr.slice(-250_000) + t.slice(-250_000);
+        } else {
+          stderr += t;
+        }
+      });
       proc.on("error", reject);
       proc.on("close", (code) => {
         if (buffer.trim()) processLine(buffer);
@@ -1086,11 +1242,18 @@ export default function (pi: ExtensionAPI) {
         if (!workflowUsesAgent(workflow, params.agent)) throw new Error(`Agent ${params.agent} is not part of workflow ${workflow.name}.`);
         if (!isDirectChild(workflow, from, params.agent)) {
           const path = delegationPath(workflow, from, params.agent).join(" → ");
-          throw new Error(`Invalid delegation: ${from} can delegate only to direct children. Use path: ${path || `${from} → ${params.agent}`}.`);
+          const children = directChildNames(workflow, from);
+          const childList = children.length ? children.join(", ") : "none (leaf agent)";
+          throw new Error(`Invalid delegation: ${from} can delegate only to direct children (${childList}). Use path: ${path || `${from} → ${params.agent}`}. If ${from} is a leaf agent, return a handoff request to the parent instead of delegating to siblings.`);
         }
       }
 
-      const previousAgent = currentAgent;
+      const parentAgent = from || executionAgent || primaryAgent(workflow);
+      const restoreParentAgent = () => {
+        if (parentAgent && setCurrentAgent(parentAgent)) return;
+        refreshActiveStateFromDisk();
+      };
+
       setCurrentAgent(params.agent, params.task.slice(0, 80));
       delegateActivity = {
         agent: params.agent,
@@ -1104,8 +1267,21 @@ export default function (pi: ExtensionAPI) {
         message: params.task.slice(0, 90),
       };
       updateWidget(ctx);
-      const result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, signal, ctx);
-      if (previousAgent) setCurrentAgent(previousAgent);
+
+      let result: { output: string; stderr: string; exitCode: number };
+      try {
+        result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, parentAgent, signal, ctx);
+      } catch (error) {
+        restoreParentAgent();
+        if (delegateActivity) {
+          delegateActivity.status = "failed";
+          delegateActivity.completedAt = Date.now();
+          delegateActivity.message = error instanceof Error ? error.message : String(error);
+          updateWidget(ctx);
+        }
+        throw error;
+      }
+      restoreParentAgent();
 
       if (result.exitCode !== 0) {
         if (delegateActivity) {
@@ -1124,7 +1300,7 @@ export default function (pi: ExtensionAPI) {
       }
       return {
         content: [{ type: "text", text: result.output }],
-        details: { agent: params.agent, task: params.task, stderr: result.stderr, exitCode: result.exitCode },
+        details: { agent: params.agent, parentAgent, task: params.task, stderr: result.stderr, exitCode: result.exitCode },
       };
     },
   });
@@ -1153,7 +1329,6 @@ export default function (pi: ExtensionAPI) {
       }
       ctx.ui.notify(`Active workflow: ${args}`, "info");
       updateWidget(ctx);
-      // Let pi expand the skill command so the agent receives SKILL.md content
       return { action: "continue" as const };
     }
 
@@ -1161,8 +1336,7 @@ export default function (pi: ExtensionAPI) {
       deactivateWorkflow();
       ctx.ui.notify("Multi-agent workflow deactivated", "info");
       updateWidget(ctx);
-      // Let pi expand the skill command so the agent receives updated context
-      return { action: "continue" as const };
+      return { action: "handled" as const };
     }
 
     if (command === "list") {
@@ -1210,10 +1384,17 @@ export default function (pi: ExtensionAPI) {
       const primary = primaryAgent(workflow);
       if (primary && !FORCED_AGENT) {
         currentAgent = primary;
+        executionAgent = primary;
         currentMode = "primary";
         currentTask = typeof event.prompt === "string" ? event.prompt.slice(0, 80) : null;
       }
+      const runtimeAgent = activeAgentName() || primary;
+      const children = directChildNames(workflow, runtimeAgent);
       updateWidget(ctx);
+      // Inject active workflow state into the system prompt so the agent
+      // knows the workflow is already active and does not attempt to re-activate.
+      const stateNote = `\n\n## Active Workflow State\nWorkflow: ${activeWorkflowName}\nStatus: active\nPrimary agent: ${primary || "unknown"}\nCurrent execution agent: ${runtimeAgent || "unknown"}\nParent agent: ${process.env.MULTI_AGENT_PARENT || "none"}\nDirect children for current execution agent: ${children.length ? children.join(", ") : "none"}\nIMPORTANT: This workflow is already active. Do NOT attempt to re-activate it via /skill:multi-agent activate or any other means. Proceed with the workflow phases as defined in the workflow file. delegate_agent may target only the direct children listed above. If the current execution agent has no direct children and work belongs to a sibling or parent, report a handoff request to the parent instead of calling delegate_agent.\n`;
+      return { systemPrompt: `${event.systemPrompt}${stateNote}` };
     }
   });
 
@@ -1252,6 +1433,7 @@ export default function (pi: ExtensionAPI) {
       workflowActive = false;
       activeWorkflowName = null;
       currentAgent = null;
+      executionAgent = null;
       currentMode = null;
       currentTask = null;
       autoCompactTriggered = false;

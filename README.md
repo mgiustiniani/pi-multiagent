@@ -7,13 +7,13 @@ It provides:
 - workflow-bound hierarchical delegation rules;
 - sequential execution constraints;
 - dynamic discovery of agents and workflows;
-- reusable generic agents: `documenter` and `c4model`;
+- reusable generic agents: `documenter`, `c4model`, and shared JavaScript/TypeScript frontend agents;
 - generic C4/Structurizr tooling used by `c4model`;
 - a validator/runtime extension with `delegate_agent`;
 - a TUI status panel extension;
 - a generic capability registry that workflow packs can extend.
 
-It does **not** include Java-specific implementation agents or the `full-development` workflow. Install workflow packs after installing this base skill.
+It does **not** include Java-, Tauri-, or native C/C++/Objective-C-specific implementation agents or workflows. Install workflow packs after installing this base skill. Shared frontend agents live in the base skill so multiple packs can reuse the same JavaScript/TypeScript frontend workflow roles.
 
 ## Install in pi
 
@@ -36,6 +36,12 @@ Expected files/directories include:
 SKILL.md
 agents/documenter.md
 agents/c4model.md
+agents/frontend-scaffolder.md
+agents/frontend-core-coder.md
+agents/frontend-ui-coder.md
+agents/frontend-app-coder.md
+agents/browser-adapter-coder.md
+agents/frontend-tester.md
 workflows/
 enforcement/
 extensions/
@@ -89,6 +95,21 @@ The TUI widget is split into two side-by-side blocks on wide terminals:
 The activity block is UI-only metadata. It does not stream child-agent tool output into the main model context.
 
 On narrow terminals the blocks stack vertically.
+
+## Shared frontend agents
+
+The base skill provides reusable frontend agents for workflows that need JavaScript/TypeScript frontend work:
+
+```text
+frontend-scaffolder
+frontend-core-coder
+frontend-ui-coder
+frontend-app-coder
+browser-adapter-coder
+frontend-tester
+```
+
+Workflow packs should include these agents in their workflow hierarchy when their domain stack needs frontend code. The base capability registry owns common frontend paths such as `packages/ui/**`, `packages/web-core/**`, `packages/browser-adapters/**`, and `apps/web/src/**`.
 
 ## Workflow pack registry fragments
 

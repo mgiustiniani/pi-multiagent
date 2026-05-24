@@ -17,8 +17,11 @@ When a workflow is active, it:
    - `enforcement/capability-registry.json`
    - `enforcement/packs/*/capability-registry.json`
 5. Blocks invalid mutating tool calls.
-6. Blocks parallel tool batches while a workflow is active.
-7. Provides `delegate_agent` for sequential direct-child delegation.
+6. Applies registry `denyRules` for workflow-specific forbidden paths.
+7. Applies path ownership rules by choosing the most specific active-workflow owner when multiple packs are installed.
+8. Checks likely file-mutating `bash` commands for denied/owned paths to reduce shell bypasses.
+9. Blocks parallel tool batches while a workflow is active.
+10. Provides `delegate_agent` for sequential direct-child delegation.
 
 If no workflow is active, no delegation enforcement applies.
 
@@ -29,6 +32,14 @@ Workflow packs should install registry fragments under:
 ```text
 enforcement/packs/<pack-name>/capability-registry.json
 ```
+
+Registry fragments can define:
+
+- `owners`: capability owner mapping;
+- `aliases`: capability aliases;
+- `fileRules`: path ownership rules with optional `workflows`, `allowedOwners`, and `reason` fields;
+- `denyRules`: workflow-scoped path deny rules;
+- `sharedOwnership`: path ownership metadata used for shared documents such as test reports.
 
 This keeps the base framework generic while allowing packs to define concrete ownership rules.
 

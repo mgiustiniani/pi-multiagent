@@ -13,7 +13,7 @@ MASF is a framework for defining and executing hierarchical, workflow-bound,
 sequentially delegated agent systems.
 
 This base skill contains the generic framework, enforcement rules, the TUI status
-extension, and the `delegate_agent` runtime tool. Concrete workflow-specific agents and workflows are installed as workflow packs. The base skill ships reusable `documenter` and `c4model` agents so workflow packs can share documentation and C4 behavior.
+extension, and the `delegate_agent` runtime tool. Concrete workflow-specific agents and workflows are installed as workflow packs. The base skill ships reusable `documenter`, `c4model`, and JavaScript/TypeScript frontend agents so workflow packs can share documentation, C4, and frontend behavior.
 
 ## Core Principles
 
@@ -31,7 +31,13 @@ multi-agent/
 ├── SKILL.md
 ├── agents/                     # Generic base agents + installed pack agents
 │   ├── documenter.md
-│   └── c4model.md
+│   ├── c4model.md
+│   ├── frontend-scaffolder.md
+│   ├── frontend-core-coder.md
+│   ├── frontend-ui-coder.md
+│   ├── frontend-app-coder.md
+│   ├── browser-adapter-coder.md
+│   └── frontend-tester.md
 ├── workflows/                  # Installed workflow definitions
 ├── docs/
 │   └── custom-agents-and-workflows.md

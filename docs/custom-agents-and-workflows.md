@@ -74,6 +74,36 @@ If the task can be inferred from file paths, update `enforcement/capability-regi
 
 For tasks that cannot be inferred mechanically, delegate explicitly with `delegate_agent`.
 
+Optional `fileRules` fields:
+
+```json
+{
+  "pattern": "src/**/*.ts",
+  "capability": "frontend-app-code-generation",
+  "owner": "frontend-app-coder",
+  "workflows": ["my-workflow"],
+  "allowedOwners": ["frontend-app-coder", "frontend-tester"],
+  "reason": "frontend app source"
+}
+```
+
+Use `denyRules` for workflow-specific forbidden paths:
+
+```json
+{
+  "denyRules": [
+    {
+      "workflows": ["c-development"],
+      "pattern": "**/*.cpp",
+      "capability": "strict-c-language-mode",
+      "reason": "C workflow forbids C++ files"
+    }
+  ]
+}
+```
+
+The validator also checks likely file-mutating `bash` commands against `fileRules` and `denyRules`; avoid shell redirection to bypass ownership.
+
 ## Delegation Rules
 
 - A parent may delegate only to direct children.
