@@ -44,6 +44,19 @@ interface WorkflowInfo {
   filePath: string;
 }
 
+interface WorkflowModelLock {
+  provider: string;
+  model: string;
+  thinkingLevel?: string;
+  lockedAt: string;
+}
+
+interface WorkflowState {
+  workflow: string | null;
+  active: boolean;
+  modelLock?: WorkflowModelLock | null;
+}
+
 type AgentMode = "primary" | "delegated";
 type PanelView = "compact" | "list" | "detail";
 
@@ -55,6 +68,9 @@ const LEGACY_ACTIVE_WORKFLOW_FILE = join(SKILL_DIR, ".active-workflow");
 const CAPABILITY_REGISTRY_FILE = join(SKILL_DIR, "enforcement", "capability-registry.json");
 const FORCED_AGENT = process.env.MULTI_AGENT_AGENT || null;
 const FORCED_WORKFLOW = process.env.MULTI_AGENT_WORKFLOW || null;
+const FORCED_MODEL_PROVIDER = process.env.MULTI_AGENT_MODEL_PROVIDER || null;
+const FORCED_MODEL_ID = process.env.MULTI_AGENT_MODEL_ID || null;
+const FORCED_THINKING_LEVEL = process.env.MULTI_AGENT_THINKING_LEVEL || null;
 const STATE_SCOPE = (process.env.MULTI_AGENT_STATE_SCOPE || "session").toLowerCase(); // session | project | legacy
 const MAX_COMPACT_WORKFLOWS = Number(process.env.MULTI_AGENT_MAX_COMPACT_WORKFLOWS || 6);
 const MAX_WIDGET_LINES = Number(process.env.MULTI_AGENT_MAX_WIDGET_LINES || 12);
@@ -229,30 +245,81 @@ function loadWorkflows(): WorkflowInfo[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function readActiveWorkflowFile(filePath: string): { workflow: string | null; active: boolean } | null {
+function modelLockFromValues(
+  provider: unknown,
+  model: unknown,
+  thinkingLevel?: unknown,
+  lockedAt?: unknown,
+): WorkflowModelLock | null {
+  if (typeof provider !== "string" || provider.trim().length === 0) return null;
+  if (typeof model !== "string" || model.trim().length === 0) return null;
+  const lock: WorkflowModelLock = {
+    provider: provider.trim(),
+    model: model.trim(),
+    lockedAt: typeof lockedAt === "string" && lockedAt.trim().length > 0 ? lockedAt.trim() : new Date().toISOString(),
+  };
+  if (typeof thinkingLevel === "string" && thinkingLevel.trim().length > 0) lock.thinkingLevel = thinkingLevel.trim();
+  return lock;
+}
+
+function forcedModelLock(): WorkflowModelLock | null {
+  return modelLockFromValues(FORCED_MODEL_PROVIDER, FORCED_MODEL_ID, FORCED_THINKING_LEVEL, process.env.MULTI_AGENT_MODEL_LOCKED_AT);
+}
+
+function modelLockLabel(lock: WorkflowModelLock | null | undefined): string {
+  if (!lock) return "unlocked";
+  const thinking = lock.thinkingLevel ? `:${lock.thinkingLevel}` : "";
+  return `${lock.provider}/${lock.model}${thinking}`;
+}
+
+function readActiveWorkflowFile(filePath: string): WorkflowState | null {
   if (!existsSync(filePath)) return null;
 
   const content = readFileSync(filePath, "utf8");
   const workflow = content.match(/^workflow:\s*(\S+)/m)?.[1] || null;
   const status = content.match(/^status:\s*(\S+)/m)?.[1] || "inactive";
-  return { workflow, active: status === "active" && Boolean(workflow) };
+  const activatedAt = content.match(/^activated_at:\s*(.+)$/m)?.[1];
+  const modelLock = modelLockFromValues(
+    content.match(/^model_provider:\s*(.+)$/m)?.[1],
+    content.match(/^model_id:\s*(.+)$/m)?.[1],
+    content.match(/^thinking_level:\s*(.+)$/m)?.[1],
+    content.match(/^model_locked_at:\s*(.+)$/m)?.[1] || activatedAt,
+  );
+  return { workflow, active: status === "active" && Boolean(workflow), modelLock };
 }
 
 function projectActiveWorkflowFile(cwd: string): string {
   return join(cwd, ".pi", "multi-agent", "active-workflow.yml");
 }
 
-function parseActiveWorkflowFile(cwd: string, sessionState: { workflow: string | null; active: boolean } | null): { workflow: string | null; active: boolean } {
-  if (FORCED_WORKFLOW) return { workflow: FORCED_WORKFLOW, active: true };
-  if (STATE_SCOPE === "session") return sessionState || { workflow: null, active: false };
-  if (STATE_SCOPE === "project") return readActiveWorkflowFile(projectActiveWorkflowFile(cwd)) || { workflow: null, active: false };
-  if (STATE_SCOPE === "legacy") return readActiveWorkflowFile(LEGACY_ACTIVE_WORKFLOW_FILE) || { workflow: null, active: false };
-  return sessionState || { workflow: null, active: false };
+function parseActiveWorkflowFile(cwd: string, sessionState: WorkflowState | null): WorkflowState {
+  if (FORCED_WORKFLOW) return { workflow: FORCED_WORKFLOW, active: true, modelLock: forcedModelLock() };
+  if (STATE_SCOPE === "session") return sessionState || { workflow: null, active: false, modelLock: null };
+  if (STATE_SCOPE === "project") return readActiveWorkflowFile(projectActiveWorkflowFile(cwd)) || { workflow: null, active: false, modelLock: null };
+  if (STATE_SCOPE === "legacy") return readActiveWorkflowFile(LEGACY_ACTIVE_WORKFLOW_FILE) || { workflow: null, active: false, modelLock: null };
+  return sessionState || { workflow: null, active: false, modelLock: null };
 }
 
-function persistActiveWorkflow(cwd: string, workflowName: string): void {
+function workflowStateFileContent(cwd: string, workflowName: string, modelLock: WorkflowModelLock | null): string {
+  const activatedAt = new Date().toISOString();
+  const lines = [
+    `workflow: ${workflowName}`,
+    `project: ${cwd}`,
+    `activated_at: ${activatedAt}`,
+    "status: active",
+  ];
+  if (modelLock) {
+    lines.push(`model_provider: ${modelLock.provider}`);
+    lines.push(`model_id: ${modelLock.model}`);
+    if (modelLock.thinkingLevel) lines.push(`thinking_level: ${modelLock.thinkingLevel}`);
+    lines.push(`model_locked_at: ${modelLock.lockedAt || activatedAt}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function persistActiveWorkflow(cwd: string, workflowName: string, modelLock: WorkflowModelLock | null): void {
   if (STATE_SCOPE === "session") return;
-  const content = `workflow: ${workflowName}\nproject: ${cwd}\nactivated_at: ${new Date().toISOString()}\nstatus: active\n`;
+  const content = workflowStateFileContent(cwd, workflowName, modelLock);
   if (STATE_SCOPE === "project") {
     const projectFile = projectActiveWorkflowFile(cwd);
     mkdirSync(dirname(projectFile), { recursive: true });
@@ -309,9 +376,10 @@ export default function (pi: ExtensionAPI) {
   let workflows: WorkflowInfo[] = [];
   let registry: CapabilityRegistry = {};
   let currentCwd = process.cwd();
-  let sessionWorkflowState: { workflow: string | null; active: boolean } | null = null;
+  let sessionWorkflowState: WorkflowState | null = null;
   let workflowActive = false;
   let activeWorkflowName: string | null = null;
+  let activeModelLock: WorkflowModelLock | null = forcedModelLock();
   let currentAgent: string | null = null;
   // Agent that owns the current process turn for enforcement/delegation.
   // currentAgent is allowed to move for UI display while a child is running;
@@ -330,7 +398,7 @@ export default function (pi: ExtensionAPI) {
     registry = loadCapabilityRegistry();
   }
 
-  function readSessionWorkflowState(ctx: any): { workflow: string | null; active: boolean } | null {
+  function readSessionWorkflowState(ctx: any): WorkflowState | null {
     const entries = typeof ctx?.sessionManager?.getBranch === "function"
       ? ctx.sessionManager.getBranch()
       : typeof ctx?.sessionManager?.getEntries === "function"
@@ -343,21 +411,29 @@ export default function (pi: ExtensionAPI) {
       const data = entry.data || {};
       const workflow = typeof data.workflow === "string" && data.workflow ? data.workflow : null;
       const status = typeof data.status === "string" ? data.status : data.active === true ? "active" : "inactive";
-      return { workflow, active: status === "active" && Boolean(workflow) };
+      const rawLock = data.modelLock || {};
+      const modelLock = modelLockFromValues(
+        rawLock.provider || data.model_provider,
+        rawLock.model || rawLock.id || data.model_id,
+        rawLock.thinkingLevel || data.thinking_level,
+        rawLock.lockedAt || data.model_locked_at || data.updated_at,
+      );
+      return { workflow, active: status === "active" && Boolean(workflow), modelLock };
     }
 
     return null;
   }
 
-  function appendSessionWorkflowState(workflow: string | null, status: "active" | "inactive"): void {
+  function appendSessionWorkflowState(workflow: string | null, status: "active" | "inactive", modelLock: WorkflowModelLock | null = activeModelLock): void {
     if (STATE_SCOPE !== "session") return;
     pi.appendEntry(WORKFLOW_STATE_ENTRY, {
       workflow,
       status,
       project: currentCwd,
+      modelLock,
       updated_at: new Date().toISOString(),
     });
-    sessionWorkflowState = { workflow, active: status === "active" && Boolean(workflow) };
+    sessionWorkflowState = { workflow, active: status === "active" && Boolean(workflow), modelLock };
   }
 
   function setCwd(ctx: any): void {
@@ -417,17 +493,53 @@ export default function (pi: ExtensionAPI) {
     return workflow?.hierarchy[0]?.name || workflow?.agents[0] || null;
   }
 
+  function captureModelLock(ctx: any): WorkflowModelLock | null {
+    return modelLockFromValues(ctx?.model?.provider, ctx?.model?.id, pi.getThinkingLevel?.(), new Date().toISOString());
+  }
+
+  function delegatedModelArgs(): string[] {
+    if (!activeModelLock) return [];
+    const args: string[] = [];
+    if (activeModelLock.provider) args.push("--provider", activeModelLock.provider);
+    args.push("--model", activeModelLock.model);
+    if (activeModelLock.thinkingLevel) args.push("--thinking", activeModelLock.thinkingLevel);
+    return args;
+  }
+
+  async function applyModelLock(ctx: any): Promise<void> {
+    if (!workflowActive || !activeModelLock) return;
+    const current = ctx?.model;
+    const sameModel = current?.provider === activeModelLock.provider && current?.id === activeModelLock.model;
+    if (!sameModel) {
+      const lockedModel = ctx?.modelRegistry?.find?.(activeModelLock.provider, activeModelLock.model);
+      if (lockedModel) {
+        const ok = await pi.setModel(lockedModel);
+        if (!ok && ctx?.hasUI) ctx.ui.notify(`Workflow model lock has no available credentials: ${modelLockLabel(activeModelLock)}`, "warning");
+      } else if (ctx?.hasUI) ctx.ui.notify(`Workflow model lock not found: ${modelLockLabel(activeModelLock)}`, "warning");
+    }
+    if (activeModelLock.thinkingLevel) pi.setThinkingLevel(activeModelLock.thinkingLevel as any);
+  }
+
   function refreshActiveStateFromDisk(): void {
+    const previousWorkflowName = activeWorkflowName;
+    const previousModelLock = activeModelLock;
     const active = parseActiveWorkflowFile(currentCwd, sessionWorkflowState);
     workflowActive = active.active;
     activeWorkflowName = active.active ? active.workflow : null;
 
     if (!workflowActive) {
+      activeModelLock = null;
       currentAgent = null;
       executionAgent = null;
       currentMode = null;
       currentTask = null;
       return;
+    }
+
+    if (active.workflow !== previousWorkflowName || !previousModelLock) {
+      activeModelLock = active.modelLock || forcedModelLock() || previousModelLock || null;
+    } else {
+      activeModelLock = previousModelLock;
     }
 
     const workflow = getWorkflow(activeWorkflowName);
@@ -447,19 +559,20 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function activateWorkflow(workflowName: string, task: string | null = null): boolean {
+  function activateWorkflow(workflowName: string, task: string | null = null, modelLock: WorkflowModelLock | null = null): boolean {
     const workflow = getWorkflow(workflowName);
     if (!workflow) return false;
 
     forceWorkflowList = false;
     workflowActive = true;
     activeWorkflowName = workflow.name;
+    activeModelLock = modelLock;
     currentAgent = primaryAgent(workflow);
     executionAgent = currentAgent;
     currentMode = currentAgent ? "primary" : null;
     currentTask = task;
-    appendSessionWorkflowState(workflow.name, "active");
-    persistActiveWorkflow(currentCwd, workflow.name);
+    appendSessionWorkflowState(workflow.name, "active", activeModelLock);
+    persistActiveWorkflow(currentCwd, workflow.name, activeModelLock);
     return true;
   }
 
@@ -468,12 +581,13 @@ export default function (pi: ExtensionAPI) {
     const lastWorkflow = activeWorkflowName;
     workflowActive = false;
     activeWorkflowName = null;
+    activeModelLock = null;
     currentAgent = null;
     executionAgent = null;
     currentMode = null;
     currentTask = null;
     autoCompactTriggered = false;
-    appendSessionWorkflowState(lastWorkflow, "inactive");
+    appendSessionWorkflowState(lastWorkflow, "inactive", null);
     persistInactiveWorkflow(currentCwd, lastWorkflow);
   }
 
@@ -1033,10 +1147,11 @@ export default function (pi: ExtensionAPI) {
       const workflow = getWorkflow();
       const workflowName = workflow?.name || activeWorkflowName || "unknown";
       const task = currentTask ? theme.fg("dim", ` — ${currentTask}`) : "";
+      const model = activeModelLock ? theme.fg("dim", ` | model: ${modelLockLabel(activeModelLock)}`) : "";
       const chain = currentAgentChain(workflow);
       const activeLabel = chain.length ? chain.join(" → ") : currentAgent || "unknown";
       const lines = [
-        truncateToWidth(`${theme.fg("success", "● Multi-Agent")} ${theme.fg("accent", workflowName)} ${theme.fg("dim", "| active:")} ${theme.fg("success", activeLabel)}${task}`, width),
+        truncateToWidth(`${theme.fg("success", "● Multi-Agent")} ${theme.fg("accent", workflowName)} ${theme.fg("dim", "| active:")} ${theme.fg("success", activeLabel)}${model}${task}`, width),
       ];
 
       if (view === "compact") {
@@ -1136,6 +1251,7 @@ export default function (pi: ExtensionAPI) {
       "--mode", "json",
       "-p",
       "--no-session",
+      ...delegatedModelArgs(),
       "--skill", SKILL_DIR,
       "--extension", EXTENSION_FILE,
       "--append-system-prompt", agent.filePath,
@@ -1147,7 +1263,16 @@ export default function (pi: ExtensionAPI) {
       const proc = spawn(invocation.command, invocation.args, {
         cwd,
         shell: false,
-        env: { ...process.env, MULTI_AGENT_AGENT: agentName, MULTI_AGENT_PARENT: parentAgent || "", MULTI_AGENT_WORKFLOW: activeWorkflowName || "" },
+        env: {
+          ...process.env,
+          MULTI_AGENT_AGENT: agentName,
+          MULTI_AGENT_PARENT: parentAgent || "",
+          MULTI_AGENT_WORKFLOW: activeWorkflowName || "",
+          MULTI_AGENT_MODEL_PROVIDER: activeModelLock?.provider || "",
+          MULTI_AGENT_MODEL_ID: activeModelLock?.model || "",
+          MULTI_AGENT_THINKING_LEVEL: activeModelLock?.thinkingLevel || "",
+          MULTI_AGENT_MODEL_LOCKED_AT: activeModelLock?.lockedAt || "",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -1322,12 +1447,13 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /skill:multi-agent activate <workflow>", "error");
         return { action: "handled" as const };
       }
-      if (!activateWorkflow(args, "activated")) {
+      const modelLock = captureModelLock(ctx);
+      if (!activateWorkflow(args, "activated", modelLock)) {
         ctx.ui.notify(`Workflow not found: ${args}`, "error");
         updateWidget(ctx);
         return { action: "handled" as const };
       }
-      ctx.ui.notify(`Active workflow: ${args}`, "info");
+      ctx.ui.notify(`Active workflow: ${args} • model locked: ${modelLockLabel(modelLock)}`, "info");
       updateWidget(ctx);
       return { action: "continue" as const };
     }
@@ -1359,7 +1485,7 @@ export default function (pi: ExtensionAPI) {
       forceWorkflowList = false;
       panelView = "compact";
       updateWidget(ctx);
-      ctx.ui.notify(workflowActive ? `Active: ${activeWorkflowName}` : "No active workflow", "info");
+      ctx.ui.notify(workflowActive ? `Active: ${activeWorkflowName} • model locked: ${modelLockLabel(activeModelLock)}` : "No active workflow", "info");
       return { action: "handled" as const };
     }
 
@@ -1379,6 +1505,7 @@ export default function (pi: ExtensionAPI) {
     refreshActiveStateFromDisk();
 
     if (workflowActive) {
+      await applyModelLock(ctx);
       forceWorkflowList = false;
       const workflow = getWorkflow();
       const primary = primaryAgent(workflow);
@@ -1393,7 +1520,7 @@ export default function (pi: ExtensionAPI) {
       updateWidget(ctx);
       // Inject active workflow state into the system prompt so the agent
       // knows the workflow is already active and does not attempt to re-activate.
-      const stateNote = `\n\n## Active Workflow State\nWorkflow: ${activeWorkflowName}\nStatus: active\nPrimary agent: ${primary || "unknown"}\nCurrent execution agent: ${runtimeAgent || "unknown"}\nParent agent: ${process.env.MULTI_AGENT_PARENT || "none"}\nDirect children for current execution agent: ${children.length ? children.join(", ") : "none"}\nIMPORTANT: This workflow is already active. Do NOT attempt to re-activate it via /skill:multi-agent activate or any other means. Proceed with the workflow phases as defined in the workflow file. delegate_agent may target only the direct children listed above. If the current execution agent has no direct children and work belongs to a sibling or parent, report a handoff request to the parent instead of calling delegate_agent.\n`;
+      const stateNote = `\n\n## Active Workflow State\nWorkflow: ${activeWorkflowName}\nStatus: active\nPrimary agent: ${primary || "unknown"}\nCurrent execution agent: ${runtimeAgent || "unknown"}\nParent agent: ${process.env.MULTI_AGENT_PARENT || "none"}\nWorkflow model lock: ${modelLockLabel(activeModelLock)}\nDirect children for current execution agent: ${children.length ? children.join(", ") : "none"}\nIMPORTANT: This workflow is already active. Do NOT attempt to re-activate it via /skill:multi-agent activate or any other means. Proceed with the workflow phases as defined in the workflow file. delegate_agent may target only the direct children listed above. If the current execution agent has no direct children and work belongs to a sibling or parent, report a handoff request to the parent instead of calling delegate_agent.\n`;
       return { systemPrompt: `${event.systemPrompt}${stateNote}` };
     }
   });
@@ -1432,6 +1559,7 @@ export default function (pi: ExtensionAPI) {
       forceWorkflowList = false;
       workflowActive = false;
       activeWorkflowName = null;
+      activeModelLock = null;
       currentAgent = null;
       executionAgent = null;
       currentMode = null;

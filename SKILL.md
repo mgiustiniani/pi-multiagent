@@ -115,6 +115,10 @@ The extension merges all registries dynamically.
 /skill:multi-agent deactivate
 ```
 
+## Workflow Model Lock
+
+When a workflow is activated, the extension snapshots the currently selected provider/model and thinking level for that activation. Parent turns re-apply that snapshot before agent execution, and `delegate_agent` starts child pi processes with the same locked model flags. This prevents model changes in another pi instance, or later global/default model changes, from changing the model used by an already-active workflow. To intentionally use a different model, deactivate and activate the workflow again after selecting the desired model.
+
 ## Extension
 
 Load the extension to enable the status panel, validator, project-local workflow state, and `delegate_agent`:
