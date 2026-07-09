@@ -1,5 +1,7 @@
 # pi-multiagent
 
+[![CI](https://github.com/mgiustiniani/pi-multiagent/actions/workflows/ci.yml/badge.svg)](https://github.com/mgiustiniani/pi-multiagent/actions/workflows/ci.yml)
+
 `pi-multiagent` is the base Multi-Agent System Framework (MASF) skill for pi.
 
 It provides:

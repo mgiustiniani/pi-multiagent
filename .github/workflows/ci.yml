@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  base-skill:
+    name: Base skill verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate C4 helper shell scripts
+        run: bash -n tools/c4model-build-structurizr.sh tools/c4model-export-images.sh tools/c4model-export.sh tools/c4model-export-static.sh tools/c4model-local.sh tools/c4model-validate.sh
+
+      - name: Validate package metadata
+        run: |
+          set -euo pipefail
+          test -f package.json
+          python3 -m json.tool package.json >/dev/null
+
+      - name: Smoke base skill layout
+        run: |
+          set -euo pipefail
+          test -f SKILL.md
+          test -f agents/documenter.md
+          test -f agents/c4model.md
+          test -f agents/domain-expert.md
+          test -f enforcement/capability-registry.json
+          test -f extensions/multi-agent-status-panel.ts
+          test -d tools
+          grep -q 'Workflow Binding' SKILL.md
+          grep -q 'structurizr-relationship-strategy' agents/c4model.md
