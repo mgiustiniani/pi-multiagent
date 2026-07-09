@@ -1,0 +1,10 @@
+{
+  "name": "pi-multiagent",
+  "version": "1.0.0",
+  "description": "Multi-Agent System Framework (MASF)",
+  "pi": {
+    "dependencies": {
+      "@zosmaai/pi-llm-wiki": "^0.10.0"
+    }
+  }
+}

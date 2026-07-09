@@ -137,6 +137,16 @@ MULTI_AGENT_STATE_SCOPE=project   # store/read .pi/multi-agent/active-workflow.y
 MULTI_AGENT_STATE_SCOPE=legacy    # store/read the old skill-local .active-workflow
 ```
 
+## Dependencies
+
+This skill requires the following Pi packages:
+
+- `@zosmaai/pi-llm-wiki` — Self-maintaining, Obsidian-compatible knowledge base for domain research (Karpathy LLM Wiki pattern). Install with:
+
+```bash
+pi install npm:@zosmaai/pi-llm-wiki
+```
+
 ## Extending the Framework
 
 See `docs/custom-agents-and-workflows.md`.
