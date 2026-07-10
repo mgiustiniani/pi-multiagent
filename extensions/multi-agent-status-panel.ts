@@ -16,8 +16,10 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { fileURLToPath } from "node:url";
@@ -122,6 +124,36 @@ interface DelegateActivity {
   message?: string;
 }
 
+interface GitTraceState {
+  head: string | null;
+  tree: string | null;
+  statusPorcelainV2: string | null;
+}
+
+interface DelegationTrace {
+  traceId: string;
+  traceDir: string;
+  eventsPath: string;
+  metadataPath: string;
+  patchPath: string;
+  sealPath: string;
+  sequence: number;
+  previousHash: string;
+  startedAt: string;
+  initialGit: GitTraceState;
+}
+
+interface DelegationTraceResult {
+  traceId: string;
+  tracePath: string;
+  metadataPath: string;
+  patchPath: string | null;
+  sealPath: string;
+  sha256: string;
+  eventCount: number;
+  complete: boolean;
+}
+
 const DEFAULT_EMOJIS: Record<string, string> = {
   "java-planner": "🏗️",
   "java-scaffolder": "📦",
@@ -139,6 +171,189 @@ function stripQuotes(value: string): string {
 function readFrontmatter(content: string): string {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   return match ? match[1] : "";
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function sha256File(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+}
+
+function commandOutput(cwd: string, args: string[]): string | null {
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
+  if (result.status !== 0) return null;
+  return result.stdout.trimEnd();
+}
+
+function captureGitTraceState(cwd: string): GitTraceState {
+  return {
+    head: commandOutput(cwd, ["rev-parse", "HEAD"]),
+    tree: commandOutput(cwd, ["rev-parse", "HEAD^{tree}"]),
+    statusPorcelainV2: commandOutput(cwd, ["status", "--porcelain=v2", "--untracked-files=all"]),
+  };
+}
+
+function sanitizeObservableEvent(value: any): any {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item?.type !== "thinking")
+      .map((item) => sanitizeObservableEvent(item));
+  }
+  if (!value || typeof value !== "object") return value;
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "thinking" || key === "reasoning" || key === "reasoning_content") continue;
+    sanitized[key] = sanitizeObservableEvent(item);
+  }
+  return sanitized;
+}
+
+function isObservableJsonEvent(event: any): boolean {
+  return new Set([
+    "multi_agent_trace_metadata",
+    "agent_start",
+    "agent_end",
+    "agent_settled",
+    "turn_start",
+    "turn_end",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_end",
+  ]).has(String(event?.type || ""));
+}
+
+function promptVersion(agentFile: string): string | null {
+  const content = readFileSync(agentFile, "utf8");
+  return content.match(/^Prompt version:\s*(.+?)\.?\s*$/m)?.[1]?.trim() || null;
+}
+
+function createDelegationTrace(options: {
+  sessionId: string;
+  workflow: string | null;
+  parentAgent: string | null;
+  agent: AgentInfo;
+  task: string;
+  cwd: string;
+  modelLock: WorkflowModelLock | null;
+  toolRegistryFingerprint: string;
+  parentTraceId: string | null;
+}): DelegationTrace {
+  const traceId = randomUUID();
+  const root = process.env.MULTI_AGENT_TRAJECTORY_DIR || join(homedir(), ".pi", "agent", "trajectories");
+  const traceDir = join(root, safePathSegment(options.sessionId), traceId);
+  mkdirSync(traceDir, { recursive: true, mode: 0o700 });
+  try { chmodSync(traceDir, 0o700); } catch { /* Best effort on non-POSIX filesystems. */ }
+
+  const eventsPath = join(traceDir, "events.jsonl");
+  const metadataPath = join(traceDir, "metadata.json");
+  const patchPath = join(traceDir, "worktree.patch");
+  const sealPath = join(traceDir, "seal.json");
+  writeFileSync(eventsPath, "", { encoding: "utf8", mode: 0o600 });
+
+  const startedAt = new Date().toISOString();
+  const initialGit = captureGitTraceState(options.cwd);
+  const metadata = {
+    schemaVersion: "multi-agent-trajectory-v1",
+    captureMode: "RAW_EVENT_STREAM",
+    traceId,
+    parentTraceId: options.parentTraceId,
+    startedAt,
+    workflow: options.workflow,
+    parentAgent: options.parentAgent,
+    agent: options.agent.name,
+    promptVersion: promptVersion(options.agent.filePath),
+    agentDefinitionSha256: sha256File(options.agent.filePath),
+    canonicalTask: options.task,
+    canonicalTaskLanguage: "en",
+    sourceUserMessageIncluded: false,
+    modelLock: options.modelLock,
+    toolRegistryFingerprint: options.toolRegistryFingerprint,
+    initialGit,
+  };
+  writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+
+  return {
+    traceId,
+    traceDir,
+    eventsPath,
+    metadataPath,
+    patchPath,
+    sealPath,
+    sequence: 0,
+    previousHash: "0".repeat(64),
+    startedAt,
+    initialGit,
+  };
+}
+
+function appendDelegationTraceEvent(trace: DelegationTrace, event: unknown): void {
+  const base = {
+    sequence: trace.sequence,
+    capturedAt: new Date().toISOString(),
+    previousHash: trace.previousHash,
+    event: sanitizeObservableEvent(event),
+  };
+  const hash = sha256Text(canonicalJson(base));
+  appendFileSync(trace.eventsPath, `${JSON.stringify({ ...base, hash })}\n`, "utf8");
+  trace.previousHash = hash;
+  trace.sequence++;
+}
+
+function sealDelegationTrace(trace: DelegationTrace, cwd: string, exitCode: number, complete: boolean): DelegationTraceResult {
+  const finalGit = captureGitTraceState(cwd);
+  const patch = commandOutput(cwd, ["diff", "--binary", "HEAD", "--"]);
+  let patchPath: string | null = null;
+  let patchSha256: string | null = null;
+  if (patch) {
+    writeFileSync(trace.patchPath, `${patch}\n`, { encoding: "utf8", mode: 0o600 });
+    patchPath = trace.patchPath;
+    patchSha256 = sha256File(trace.patchPath);
+  }
+  const eventsSha256 = sha256File(trace.eventsPath);
+  const seal = {
+    schemaVersion: "multi-agent-trajectory-seal-v1",
+    traceId: trace.traceId,
+    startedAt: trace.startedAt,
+    sealedAt: new Date().toISOString(),
+    complete,
+    exitCode,
+    eventCount: trace.sequence,
+    finalEventHash: trace.previousHash,
+    eventsSha256,
+    metadataSha256: sha256File(trace.metadataPath),
+    patchSha256,
+    initialGit: trace.initialGit,
+    finalGit,
+  };
+  writeFileSync(trace.sealPath, `${JSON.stringify(seal, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  return {
+    traceId: trace.traceId,
+    tracePath: trace.eventsPath,
+    metadataPath: trace.metadataPath,
+    patchPath,
+    sealPath: trace.sealPath,
+    sha256: eventsSha256,
+    eventCount: trace.sequence,
+    complete,
+  };
 }
 
 function parseScalar(yaml: string, key: string): string {
@@ -504,6 +719,17 @@ export default function (pi: ExtensionAPI) {
     args.push("--model", activeModelLock.model);
     if (activeModelLock.thinkingLevel) args.push("--thinking", activeModelLock.thinkingLevel);
     return args;
+  }
+
+  function currentToolRegistryFingerprint(): string {
+    const tools = pi.getAllTools()
+      .map((tool: any) => ({
+        name: tool.name,
+        parameters: tool.parameters,
+        sourceInfo: tool.sourceInfo,
+      }))
+      .sort((left: any, right: any) => String(left.name).localeCompare(String(right.name)));
+    return sha256Text(canonicalJson(tools));
   }
 
   async function applyModelLock(ctx: any): Promise<void> {
@@ -1243,9 +1469,21 @@ export default function (pi: ExtensionAPI) {
     return { command: process.execPath, args };
   }
 
-  async function runDelegatedAgent(agentName: string, task: string, cwd: string, parentAgent: string | null, signal: AbortSignal | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number }> {
+  async function runDelegatedAgent(agentName: string, task: string, cwd: string, parentAgent: string | null, signal: AbortSignal | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number; trace: DelegationTraceResult }> {
     const agent = getAgent(agentName);
     if (!agent) throw new Error(`Unknown delegated agent: ${agentName}`);
+
+    const trace = createDelegationTrace({
+      sessionId: String(ctx?.sessionManager?.getSessionId?.() || "ephemeral"),
+      workflow: activeWorkflowName,
+      parentAgent,
+      agent,
+      task,
+      cwd,
+      modelLock: activeModelLock,
+      toolRegistryFingerprint: currentToolRegistryFingerprint(),
+      parentTraceId: process.env.MULTI_AGENT_TRACE_ID || null,
+    });
 
     const args = [
       "--mode", "json",
@@ -1272,6 +1510,10 @@ export default function (pi: ExtensionAPI) {
           MULTI_AGENT_MODEL_ID: activeModelLock?.model || "",
           MULTI_AGENT_THINKING_LEVEL: activeModelLock?.thinkingLevel || "",
           MULTI_AGENT_MODEL_LOCKED_AT: activeModelLock?.lockedAt || "",
+          MULTI_AGENT_TRACE_ID: trace.traceId,
+          MULTI_AGENT_TRACE_PATH: trace.eventsPath,
+          MULTI_AGENT_TRACE_METADATA_PATH: trace.metadataPath,
+          MULTI_AGENT_TRACE_EMIT: "1",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -1285,6 +1527,7 @@ export default function (pi: ExtensionAPI) {
         if (!line.trim()) return;
         try {
           const event = JSON.parse(line);
+          if (isObservableJsonEvent(event)) appendDelegationTraceEvent(trace, event);
           if (event.type === "message_end" && event.message?.role === "assistant") {
             const content = Array.isArray(event.message.content) ? event.message.content : [];
             for (const part of content) {
@@ -1321,16 +1564,29 @@ export default function (pi: ExtensionAPI) {
       });
       proc.stderr.on("data", (chunk) => {
         const t = chunk.toString();
+        appendDelegationTraceEvent(trace, { type: "process_stderr", text: t });
         if (stderr.length > 500_000) {
           stderr = stderr.slice(-250_000) + t.slice(-250_000);
         } else {
           stderr += t;
         }
       });
-      proc.on("error", reject);
+      let settled = false;
+      proc.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        appendDelegationTraceEvent(trace, { type: "process_error", message: error.message });
+        sealDelegationTrace(trace, cwd, -1, false);
+        reject(error);
+      });
       proc.on("close", (code) => {
+        if (settled) return;
+        settled = true;
         if (buffer.trim()) processLine(buffer);
-        resolvePromise({ output: finalOutput || stdout.trim() || "(no output)", stderr, exitCode: code ?? 0 });
+        const exitCode = code ?? 0;
+        appendDelegationTraceEvent(trace, { type: "process_exit", exitCode });
+        const sealedTrace = sealDelegationTrace(trace, cwd, exitCode, exitCode === 0);
+        resolvePromise({ output: finalOutput || stdout.trim() || "(no output)", stderr, exitCode, trace: sealedTrace });
       });
 
       const abort = () => {
@@ -1393,7 +1649,7 @@ export default function (pi: ExtensionAPI) {
       };
       updateWidget(ctx);
 
-      let result: { output: string; stderr: string; exitCode: number };
+      let result: { output: string; stderr: string; exitCode: number; trace: DelegationTraceResult };
       try {
         result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, parentAgent, signal, ctx);
       } catch (error) {
@@ -1423,9 +1679,10 @@ export default function (pi: ExtensionAPI) {
         delegateActivity.message = "completed";
         updateWidget(ctx);
       }
+      const traceSummary = `\n\n[training trajectory]\ntraceId: ${result.trace.traceId}\ntracePath: ${result.trace.tracePath}\ntraceSha256: ${result.trace.sha256}\ntraceComplete: ${result.trace.complete}`;
       return {
-        content: [{ type: "text", text: result.output }],
-        details: { agent: params.agent, parentAgent, task: params.task, stderr: result.stderr, exitCode: result.exitCode },
+        content: [{ type: "text", text: `${result.output}${traceSummary}` }],
+        details: { agent: params.agent, parentAgent, task: params.task, stderr: result.stderr, exitCode: result.exitCode, trace: result.trace },
       };
     },
   });
@@ -1503,6 +1760,20 @@ export default function (pi: ExtensionAPI) {
     setCwd(ctx);
     refreshResources();
     refreshActiveStateFromDisk();
+
+    if (process.env.MULTI_AGENT_TRACE_EMIT === "1" && ctx.mode === "json") {
+      const runtimeFingerprint = {
+        type: "multi_agent_trace_metadata",
+        traceId: process.env.MULTI_AGENT_TRACE_ID || null,
+        capturedAt: new Date().toISOString(),
+        systemPromptSha256: sha256Text(event.systemPrompt),
+        toolRegistryFingerprint: currentToolRegistryFingerprint(),
+        model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+        thinkingLevel: pi.getThinkingLevel?.() || null,
+        cwdSha256: sha256Text(ctx.cwd || currentCwd),
+      };
+      process.stdout.write(`${JSON.stringify(runtimeFingerprint)}\n`);
+    }
 
     if (workflowActive) {
       await applyModelLock(ctx);
