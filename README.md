@@ -157,6 +157,14 @@ See:
 docs/custom-agents-and-workflows.md
 ```
 
+## Documentation workflow profile proposal
+
+See the documentation-only proposal for language-agnostic documentation workflow profiles:
+
+```text
+docs/language-agnostic-documentation-workflow-proposal.md
+```
+
 ## English-only generated artifacts
 
 The base policy is that installed agents and workflows generate project artifacts in English, including:
