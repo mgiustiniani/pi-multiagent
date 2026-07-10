@@ -1401,7 +1401,7 @@ export default function (pi: ExtensionAPI) {
         lines.push(truncateToWidth(theme.fg("warning", "  Workflow has no defined agents"), width));
       }
 
-      return truncatePanel(lines, theme, width);
+      return view === "detail" ? lines : truncatePanel(lines, theme, width);
     }
 
     const lines = workflowActive && view === "list"
