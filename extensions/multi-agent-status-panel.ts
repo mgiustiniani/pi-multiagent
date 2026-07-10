@@ -77,6 +77,8 @@ const STATE_SCOPE = (process.env.MULTI_AGENT_STATE_SCOPE || "session").toLowerCa
 const MAX_COMPACT_WORKFLOWS = Number(process.env.MULTI_AGENT_MAX_COMPACT_WORKFLOWS || 6);
 const MAX_WIDGET_LINES = Number(process.env.MULTI_AGENT_MAX_WIDGET_LINES || 12);
 const WORKFLOW_STATE_ENTRY = "multi-agent-workflow-state";
+const TRAJECTORY_SCHEMA_VERSION = "multi-agent-trajectory-v1";
+const TRAJECTORY_CAPTURE_LABEL = "raw observable events + sealed SHA-256";
 
 interface CapabilityFileRule {
   pattern: string;
@@ -271,7 +273,7 @@ function createDelegationTrace(options: {
   const startedAt = new Date().toISOString();
   const initialGit = captureGitTraceState(options.cwd);
   const metadata = {
-    schemaVersion: "multi-agent-trajectory-v1",
+    schemaVersion: TRAJECTORY_SCHEMA_VERSION,
     captureMode: "RAW_EVENT_STREAM",
     traceId,
     parentTraceId: options.parentTraceId,
@@ -1384,6 +1386,9 @@ export default function (pi: ExtensionAPI) {
         lines.push(truncateToWidth(theme.fg("dim", `  ${countWorkflowAgents(workflow || { name: "", description: "", agents: [], hierarchy: [], filePath: "" })} agents • /skill:multi-agent detail for tree • /skill:multi-agent list for workflows`), width));
         return lines;
       }
+
+      lines.push(truncateToWidth(`${theme.fg("dim", "  training capture:")} ${theme.fg("success", "enabled")} ${theme.fg("dim", `(${TRAJECTORY_SCHEMA_VERSION}; ${TRAJECTORY_CAPTURE_LABEL})`)}`, width));
+      lines.push(truncateToWidth(theme.fg("dim", `  trajectory root: ${process.env.MULTI_AGENT_TRAJECTORY_DIR || join(homedir(), ".pi", "agent", "trajectories")}`), width));
 
       if (workflow?.hierarchy.length) lines.push(...renderTree(workflow, workflow.hierarchy, theme, width, "  "));
       else if (workflow?.agents.length) {
