@@ -179,14 +179,12 @@ interface AgentRunTrace {
 }
 
 interface AgentRunTraceEventInput {
-  eventType: string;
-  title: string;
-  detail?: string;
-  metadata?: Record<string, unknown>;
+  type: string;
+  [key: string]: unknown;
 }
 
-interface AgentRunTraceEvent extends AgentRunTraceEventInput {
-  schemaVersion: "ide-agent-trace-v1";
+interface MultiAgentTraceEnvelope {
+  schemaVersion: "pi-multi-agent-trace-v1";
   runId: string;
   traceId: string;
   workspaceId: string;
@@ -196,7 +194,11 @@ interface AgentRunTraceEvent extends AgentRunTraceEventInput {
   timestamp: string;
   sequence: number;
   previousHash: string;
-  hash: string;
+  hash?: string;
+}
+
+interface AgentRunTraceEvent extends AgentRunTraceEventInput {
+  multiAgent: MultiAgentTraceEnvelope;
 }
 
 const DEFAULT_EMOJIS: Record<string, string> = {
@@ -524,8 +526,9 @@ function createAgentRunTrace(options: {
 
 function appendAgentRunTraceEvent(trace: AgentRunTrace | null, input: AgentRunTraceEventInput): AgentRunTraceEvent | null {
   if (!trace) return null;
-  const base = {
-    schemaVersion: "ide-agent-trace-v1" as const,
+  const sanitizedInput = sanitizeObservableEvent(input) as AgentRunTraceEventInput;
+  const envelope: MultiAgentTraceEnvelope = {
+    schemaVersion: "pi-multi-agent-trace-v1",
     runId: trace.runId,
     traceId: trace.traceId,
     workspaceId: trace.workspaceId,
@@ -535,10 +538,10 @@ function appendAgentRunTraceEvent(trace: AgentRunTrace | null, input: AgentRunTr
     timestamp: new Date().toISOString(),
     sequence: trace.sequence,
     previousHash: trace.previousHash,
-    ...input,
   };
-  const hash = sha256Text(canonicalJson(base));
-  const event = { ...base, hash };
+  const withoutHash = { ...sanitizedInput, multiAgent: envelope };
+  const hash = sha256Text(canonicalJson(withoutHash));
+  const event = { ...sanitizedInput, multiAgent: { ...envelope, hash } };
   appendFileSync(trace.tracePath, `${JSON.stringify(event)}\n`, "utf8");
   trace.previousHash = hash;
   trace.sequence++;
@@ -547,12 +550,11 @@ function appendAgentRunTraceEvent(trace: AgentRunTrace | null, input: AgentRunTr
 
 function emitAgentRunTraceEvent(trace: AgentRunTrace | null, onUpdate: ((result: any) => void) | undefined, input: AgentRunTraceEventInput): void {
   const event = appendAgentRunTraceEvent(trace, input);
-  if (!event) return;
-  const detail = event.detail ? ` — ${event.detail}` : "";
+  if (!event || process.env.MULTI_AGENT_FORWARD_CHILD_EVENTS !== "1") return;
   try {
     onUpdate?.({
-      content: [{ type: "text", text: `[${event.eventType}] ${event.title}${detail}` }],
-      details: { multiAgentEvent: event },
+      content: [],
+      details: { event },
     });
   } catch {
     /* Progress updates are best-effort and must not fail delegation. */
@@ -1747,10 +1749,15 @@ export default function (pi: ExtensionAPI) {
     });
 
     emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-      eventType: "delegation_started",
-      title: `Delegating to ${agentName}`,
-      detail: truncateForTrace(task, 240),
-      metadata: { rawTracePath: trace.eventsPath, metadataPath: trace.metadataPath },
+      type: "tool_execution_start",
+      toolCallId: `delegate_agent:${trace.traceId}`,
+      toolName: "delegate_agent",
+      args: {
+        agent: agentName,
+        cwd,
+        taskPreview: truncateForTrace(task, 240),
+        taskSha256: sha256Text(task),
+      },
     });
 
     const args = [
@@ -1795,30 +1802,16 @@ export default function (pi: ExtensionAPI) {
         if (!line.trim()) return;
         try {
           const event = JSON.parse(line);
-          if (isObservableJsonEvent(event)) appendDelegationTraceEvent(trace, event);
-          if (event.type === "multi_agent_trace_metadata" || event.type === "agent_start") {
-            emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-              eventType: "agent_started",
-              title: `${agentName} started`,
-              metadata: { childEventType: event.type, traceId: trace.traceId },
-            });
+          if (isObservableJsonEvent(event)) {
+            appendDelegationTraceEvent(trace, event);
+            if (event.type !== "multi_agent_trace_metadata") emitAgentRunTraceEvent(agentRunTrace, onUpdate, event);
           }
-          if (event.type === "tool_call" || event.type === "tool_execution_start") {
-            const metadata = toolEventMetadata(event);
+          if (event.type === "tool_call") {
             emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-              eventType: "tool_started",
-              title: `${String(metadata.toolName)} started`,
-              detail: typeof metadata.target === "string" ? metadata.target : undefined,
-              metadata,
-            });
-          }
-          if (event.type === "tool_execution_end") {
-            const metadata = toolEventMetadata(event);
-            emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-              eventType: event.isError ? "tool_failed" : "tool_completed",
-              title: `${String(metadata.toolName)} ${event.isError ? "failed" : "completed"}`,
-              detail: typeof metadata.target === "string" ? metadata.target : undefined,
-              metadata: { ...metadata, isError: Boolean(event.isError) },
+              type: "tool_execution_start",
+              toolCallId: String(event.toolCallId || event.id || `${trace.traceId}:${trace.sequence}`),
+              toolName: traceToolName(event),
+              args: traceToolInput(event),
             });
           }
           if (event.type === "message_end" && event.message?.role === "assistant") {
@@ -1827,14 +1820,7 @@ export default function (pi: ExtensionAPI) {
               if (part?.type === "toolCall") noteDelegateToolCall(String(part.name || "tool"), part.arguments || {});
             }
             const text = content.find((part: any) => part?.type === "text")?.text;
-            if (typeof text === "string") {
-              finalOutput = text;
-              emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-                eventType: "summary",
-                title: `${agentName} produced a response`,
-                detail: truncateForTrace(text, 300),
-              });
-            }
+            if (typeof text === "string") finalOutput = text;
             if (ctx?.hasUI) updateWidget(ctx);
           }
           if (event.type === "tool_call" || event.type === "tool_execution_start") {
@@ -1878,10 +1864,14 @@ export default function (pi: ExtensionAPI) {
         appendDelegationTraceEvent(trace, { type: "process_error", message: error.message });
         const sealedTrace = sealDelegationTrace(trace, cwd, -1, false);
         emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-          eventType: "agent_failed",
-          title: `${agentName} failed to start`,
-          detail: error.message,
-          metadata: { exitCode: -1 },
+          type: "tool_execution_end",
+          toolCallId: `delegate_agent:${trace.traceId}`,
+          toolName: "delegate_agent",
+          result: {
+            content: [],
+            details: { trace: sealedTrace, errorMessage: error.message },
+          },
+          isError: true,
         });
         sealAgentRunTrace(agentRunTrace, { complete: false, exitCode: -1, rawTrace: sealedTrace });
         reject(error);
@@ -1893,23 +1883,19 @@ export default function (pi: ExtensionAPI) {
         const exitCode = code ?? 0;
         appendDelegationTraceEvent(trace, { type: "process_exit", exitCode });
         const sealedTrace = sealDelegationTrace(trace, cwd, exitCode, exitCode === 0);
-        for (const file of sealedTrace.changedFiles) {
-          emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-            eventType: "file_changed",
-            title: file.path,
-            detail: file.status,
-            metadata: { ...file },
-          });
-        }
         emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-          eventType: exitCode === 0 ? "agent_completed" : "agent_failed",
-          title: `${agentName} ${exitCode === 0 ? "completed" : "failed"}`,
-          metadata: { exitCode, changedFileCount: sealedTrace.changedFiles.length },
-        });
-        emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
-          eventType: "delegation_completed",
-          title: `Delegation to ${agentName} ${exitCode === 0 ? "completed" : "failed"}`,
-          metadata: { exitCode, trace: sealedTrace },
+          type: "tool_execution_end",
+          toolCallId: `delegate_agent:${trace.traceId}`,
+          toolName: "delegate_agent",
+          result: {
+            content: [],
+            details: {
+              trace: sealedTrace,
+              exitCode,
+              changedFiles: sealedTrace.changedFiles,
+            },
+          },
+          isError: exitCode !== 0,
         });
         sealAgentRunTrace(agentRunTrace, { complete: exitCode === 0, exitCode, rawTrace: sealedTrace });
         resolvePromise({ output: finalOutput || stdout.trim() || "(no output)", stderr, exitCode, trace: sealedTrace });
@@ -2005,9 +1991,8 @@ export default function (pi: ExtensionAPI) {
         delegateActivity.message = "completed";
         updateWidget(ctx);
       }
-      const traceSummary = `\n\n[training trajectory]\ntraceId: ${result.trace.traceId}\ntracePath: ${result.trace.tracePath}\ntraceSha256: ${result.trace.sha256}\ntraceComplete: ${result.trace.complete}`;
       return {
-        content: [{ type: "text", text: `${result.output}${traceSummary}` }],
+        content: [{ type: "text", text: result.output }],
         details: { agent: params.agent, parentAgent, task: params.task, stderr: result.stderr, exitCode: result.exitCode, trace: result.trace },
       };
     },

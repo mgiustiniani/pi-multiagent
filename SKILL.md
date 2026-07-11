@@ -126,7 +126,9 @@ Every `delegate_agent` call records two trace layers:
 - raw sealed training trajectories under `~/.pi/agent/trajectories` by default (override with `MULTI_AGENT_TRAJECTORY_DIR`);
 - IDE-friendly trace events under `<workspace>/.ide/agent-runs/<run-id>/trace.jsonl` by default (override with `MULTI_AGENT_IDE_TRACE_DIR`, disable with `MULTI_AGENT_IDE_TRACE=0`).
 
-Raw trajectories tee the child `pi --mode json` event stream, exclude thinking/reasoning fields, include prompt/tool/model fingerprints, and are sealed with SHA-256 metadata. IDE traces contain sanitized operational events for agent panels and file-change history: `delegation_started`, `agent_started`, `tool_started`, `tool_completed`, `file_changed`, `agent_completed`, and `delegation_completed`.
+Raw trajectories tee the child `pi --mode json` event stream, exclude thinking/reasoning fields, include prompt/tool/model fingerprints, and are sealed with SHA-256 metadata. IDE traces use Pi's normal event vocabulary (`agent_start`, `turn_end`, `message_end`, `tool_execution_start`, `tool_execution_end`, etc.) with a small `multiAgent` envelope for run/agent correlation. This keeps IDE integration Pi-native rather than coupled to plugin-specific event names.
+
+Trace metadata is written to files and tool-result `details`, not appended to the delegated agent's textual result. Child-event forwarding through `tool_execution_update` is opt-in with `MULTI_AGENT_FORWARD_CHILD_EVENTS=1`; by default these implementation events do not grow the parent agent's prompt context.
 
 ## Extension
 
