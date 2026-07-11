@@ -154,6 +154,49 @@ interface DelegationTraceResult {
   sha256: string;
   eventCount: number;
   complete: boolean;
+  changedFiles: AgentFileChange[];
+}
+
+interface AgentFileChange {
+  path: string;
+  status: string;
+}
+
+interface AgentRunTrace {
+  runId: string;
+  traceId: string;
+  runDir: string;
+  tracePath: string;
+  metadataPath: string;
+  sealPath: string;
+  sequence: number;
+  startedAt: string;
+  previousHash: string;
+  workflow: string | null;
+  workspaceId: string;
+  agentId: string;
+  parentAgentId: string | null;
+}
+
+interface AgentRunTraceEventInput {
+  eventType: string;
+  title: string;
+  detail?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface AgentRunTraceEvent extends AgentRunTraceEventInput {
+  schemaVersion: "ide-agent-trace-v1";
+  runId: string;
+  traceId: string;
+  workspaceId: string;
+  workflow: string | null;
+  agentId: string;
+  parentAgentId: string | null;
+  timestamp: string;
+  sequence: number;
+  previousHash: string;
+  hash: string;
 }
 
 const DEFAULT_EMOJIS: Record<string, string> = {
@@ -319,8 +362,62 @@ function appendDelegationTraceEvent(trace: DelegationTrace, event: unknown): voi
   trace.sequence++;
 }
 
+function parseGitStatusPaths(statusPorcelainV2: string | null): Map<string, string> {
+  const changes = new Map<string, string>();
+  if (!statusPorcelainV2) return changes;
+
+  for (const line of statusPorcelainV2.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    if (line.startsWith("? ")) {
+      changes.set(line.slice(2), "untracked");
+      continue;
+    }
+    if (line.startsWith("! ")) continue;
+    if (line.startsWith("1 ")) {
+      const parts = line.split(" ");
+      const path = parts.slice(8).join(" ").trim();
+      if (path) changes.set(path, parts[1] || "modified");
+      continue;
+    }
+    if (line.startsWith("2 ")) {
+      const tabIndex = line.indexOf("\t");
+      const withoutOriginal = tabIndex >= 0 ? line.slice(0, tabIndex) : line;
+      const parts = withoutOriginal.split(" ");
+      const path = parts.slice(9).join(" ").trim();
+      if (path) changes.set(path, parts[1] || "renamed");
+      continue;
+    }
+    if (line.startsWith("u ")) {
+      const parts = line.split(" ");
+      const path = parts.slice(10).join(" ").trim();
+      if (path) changes.set(path, "unmerged");
+    }
+  }
+
+  return changes;
+}
+
+function isAgentTraceArtifactPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/");
+  return normalized.startsWith(".ide/agent-runs/");
+}
+
+function computeChangedFiles(initialGit: GitTraceState, finalGit: GitTraceState): AgentFileChange[] {
+  const initial = parseGitStatusPaths(initialGit.statusPorcelainV2);
+  const final = parseGitStatusPaths(finalGit.statusPorcelainV2);
+  const changed: AgentFileChange[] = [];
+
+  for (const [path, status] of final.entries()) {
+    if (isAgentTraceArtifactPath(path)) continue;
+    if (initial.get(path) !== status) changed.push({ path, status });
+  }
+
+  return changed.sort((a, b) => a.path.localeCompare(b.path));
+}
+
 function sealDelegationTrace(trace: DelegationTrace, cwd: string, exitCode: number, complete: boolean): DelegationTraceResult {
   const finalGit = captureGitTraceState(cwd);
+  const changedFiles = computeChangedFiles(trace.initialGit, finalGit);
   const patch = commandOutput(cwd, ["diff", "--binary", "HEAD", "--"]);
   let patchPath: string | null = null;
   let patchSha256: string | null = null;
@@ -342,6 +439,7 @@ function sealDelegationTrace(trace: DelegationTrace, cwd: string, exitCode: numb
     eventsSha256,
     metadataSha256: sha256File(trace.metadataPath),
     patchSha256,
+    changedFiles,
     initialGit: trace.initialGit,
     finalGit,
   };
@@ -355,6 +453,154 @@ function sealDelegationTrace(trace: DelegationTrace, cwd: string, exitCode: numb
     sha256: eventsSha256,
     eventCount: trace.sequence,
     complete,
+    changedFiles,
+  };
+}
+
+function truncateForTrace(value: string, max = 500): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 1))}…` : normalized;
+}
+
+function workspaceIdForCwd(cwd: string): string {
+  return sha256Text(resolve(cwd)).slice(0, 16);
+}
+
+function createAgentRunTrace(options: {
+  traceId: string;
+  workflow: string | null;
+  parentAgent: string | null;
+  agent: AgentInfo;
+  task: string;
+  cwd: string;
+  rawTracePath: string;
+}): AgentRunTrace | null {
+  if (process.env.MULTI_AGENT_IDE_TRACE === "0") return null;
+  const root = process.env.MULTI_AGENT_IDE_TRACE_DIR || join(options.cwd, ".ide", "agent-runs");
+  const runId = options.traceId;
+  const runDir = join(root, safePathSegment(runId));
+  try {
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    try { chmodSync(runDir, 0o700); } catch { /* Best effort on non-POSIX filesystems. */ }
+    const tracePath = join(runDir, "trace.jsonl");
+    const metadataPath = join(runDir, "metadata.json");
+    const sealPath = join(runDir, "seal.json");
+    writeFileSync(tracePath, "", { encoding: "utf8", mode: 0o600 });
+    const startedAt = new Date().toISOString();
+    const metadata = {
+      schemaVersion: "ide-agent-run-v1",
+      runId,
+      traceId: options.traceId,
+      workflow: options.workflow,
+      workspaceId: workspaceIdForCwd(options.cwd),
+      cwd: options.cwd,
+      agentId: options.agent.name,
+      parentAgentId: options.parentAgent,
+      taskPreview: truncateForTrace(options.task, 240),
+      taskSha256: sha256Text(options.task),
+      rawTrajectoryPath: options.rawTracePath,
+      startedAt,
+    };
+    writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    return {
+      runId,
+      traceId: options.traceId,
+      runDir,
+      tracePath,
+      metadataPath,
+      sealPath,
+      sequence: 0,
+      previousHash: "0".repeat(64),
+      startedAt,
+      workflow: options.workflow,
+      workspaceId: workspaceIdForCwd(options.cwd),
+      agentId: options.agent.name,
+      parentAgentId: options.parentAgent,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function appendAgentRunTraceEvent(trace: AgentRunTrace | null, input: AgentRunTraceEventInput): AgentRunTraceEvent | null {
+  if (!trace) return null;
+  const base = {
+    schemaVersion: "ide-agent-trace-v1" as const,
+    runId: trace.runId,
+    traceId: trace.traceId,
+    workspaceId: trace.workspaceId,
+    workflow: trace.workflow,
+    agentId: trace.agentId,
+    parentAgentId: trace.parentAgentId,
+    timestamp: new Date().toISOString(),
+    sequence: trace.sequence,
+    previousHash: trace.previousHash,
+    ...input,
+  };
+  const hash = sha256Text(canonicalJson(base));
+  const event = { ...base, hash };
+  appendFileSync(trace.tracePath, `${JSON.stringify(event)}\n`, "utf8");
+  trace.previousHash = hash;
+  trace.sequence++;
+  return event;
+}
+
+function emitAgentRunTraceEvent(trace: AgentRunTrace | null, onUpdate: ((result: any) => void) | undefined, input: AgentRunTraceEventInput): void {
+  const event = appendAgentRunTraceEvent(trace, input);
+  if (!event) return;
+  const detail = event.detail ? ` — ${event.detail}` : "";
+  try {
+    onUpdate?.({
+      content: [{ type: "text", text: `[${event.eventType}] ${event.title}${detail}` }],
+      details: { multiAgentEvent: event },
+    });
+  } catch {
+    /* Progress updates are best-effort and must not fail delegation. */
+  }
+}
+
+function sealAgentRunTrace(trace: AgentRunTrace | null, options: { complete: boolean; exitCode: number; rawTrace: DelegationTraceResult }): void {
+  if (!trace) return;
+  const seal = {
+    schemaVersion: "ide-agent-run-seal-v1",
+    runId: trace.runId,
+    traceId: trace.traceId,
+    startedAt: trace.startedAt,
+    sealedAt: new Date().toISOString(),
+    complete: options.complete,
+    exitCode: options.exitCode,
+    eventCount: trace.sequence,
+    finalEventHash: trace.previousHash,
+    traceSha256: sha256File(trace.tracePath),
+    metadataSha256: sha256File(trace.metadataPath),
+    rawTrajectory: options.rawTrace,
+  };
+  writeFileSync(trace.sealPath, `${JSON.stringify(seal, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function traceToolName(event: any): string {
+  return String(event?.toolName || event?.name || event?.tool?.name || "tool");
+}
+
+function traceToolInput(event: any): any {
+  return event?.input || event?.args || event?.arguments || {};
+}
+
+function toolTarget(input: any): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  for (const key of ["path", "file_path", "url", "cwd", "agent", "command"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim()) return truncateForTrace(value, 160);
+  }
+  if (Array.isArray(input.tool_uses)) return `${input.tool_uses.length} parallel tool use(s)`;
+  return undefined;
+}
+
+function toolEventMetadata(event: any): Record<string, unknown> {
+  const input = traceToolInput(event);
+  return {
+    toolName: traceToolName(event),
+    target: toolTarget(input),
   };
 }
 
@@ -1474,7 +1720,7 @@ export default function (pi: ExtensionAPI) {
     return { command: process.execPath, args };
   }
 
-  async function runDelegatedAgent(agentName: string, task: string, cwd: string, parentAgent: string | null, signal: AbortSignal | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number; trace: DelegationTraceResult }> {
+  async function runDelegatedAgent(agentName: string, task: string, cwd: string, parentAgent: string | null, signal: AbortSignal | undefined, onUpdate: ((result: any) => void) | undefined, ctx: any): Promise<{ output: string; stderr: string; exitCode: number; trace: DelegationTraceResult }> {
     const agent = getAgent(agentName);
     if (!agent) throw new Error(`Unknown delegated agent: ${agentName}`);
 
@@ -1488,6 +1734,23 @@ export default function (pi: ExtensionAPI) {
       modelLock: activeModelLock,
       toolRegistryFingerprint: currentToolRegistryFingerprint(),
       parentTraceId: process.env.MULTI_AGENT_TRACE_ID || null,
+    });
+
+    const agentRunTrace = createAgentRunTrace({
+      traceId: trace.traceId,
+      workflow: activeWorkflowName,
+      parentAgent,
+      agent,
+      task,
+      cwd,
+      rawTracePath: trace.eventsPath,
+    });
+
+    emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+      eventType: "delegation_started",
+      title: `Delegating to ${agentName}`,
+      detail: truncateForTrace(task, 240),
+      metadata: { rawTracePath: trace.eventsPath, metadataPath: trace.metadataPath },
     });
 
     const args = [
@@ -1533,13 +1796,45 @@ export default function (pi: ExtensionAPI) {
         try {
           const event = JSON.parse(line);
           if (isObservableJsonEvent(event)) appendDelegationTraceEvent(trace, event);
+          if (event.type === "multi_agent_trace_metadata" || event.type === "agent_start") {
+            emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+              eventType: "agent_started",
+              title: `${agentName} started`,
+              metadata: { childEventType: event.type, traceId: trace.traceId },
+            });
+          }
+          if (event.type === "tool_call" || event.type === "tool_execution_start") {
+            const metadata = toolEventMetadata(event);
+            emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+              eventType: "tool_started",
+              title: `${String(metadata.toolName)} started`,
+              detail: typeof metadata.target === "string" ? metadata.target : undefined,
+              metadata,
+            });
+          }
+          if (event.type === "tool_execution_end") {
+            const metadata = toolEventMetadata(event);
+            emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+              eventType: event.isError ? "tool_failed" : "tool_completed",
+              title: `${String(metadata.toolName)} ${event.isError ? "failed" : "completed"}`,
+              detail: typeof metadata.target === "string" ? metadata.target : undefined,
+              metadata: { ...metadata, isError: Boolean(event.isError) },
+            });
+          }
           if (event.type === "message_end" && event.message?.role === "assistant") {
             const content = Array.isArray(event.message.content) ? event.message.content : [];
             for (const part of content) {
               if (part?.type === "toolCall") noteDelegateToolCall(String(part.name || "tool"), part.arguments || {});
             }
             const text = content.find((part: any) => part?.type === "text")?.text;
-            if (typeof text === "string") finalOutput = text;
+            if (typeof text === "string") {
+              finalOutput = text;
+              emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+                eventType: "summary",
+                title: `${agentName} produced a response`,
+                detail: truncateForTrace(text, 300),
+              });
+            }
             if (ctx?.hasUI) updateWidget(ctx);
           }
           if (event.type === "tool_call" || event.type === "tool_execution_start") {
@@ -1581,7 +1876,14 @@ export default function (pi: ExtensionAPI) {
         if (settled) return;
         settled = true;
         appendDelegationTraceEvent(trace, { type: "process_error", message: error.message });
-        sealDelegationTrace(trace, cwd, -1, false);
+        const sealedTrace = sealDelegationTrace(trace, cwd, -1, false);
+        emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+          eventType: "agent_failed",
+          title: `${agentName} failed to start`,
+          detail: error.message,
+          metadata: { exitCode: -1 },
+        });
+        sealAgentRunTrace(agentRunTrace, { complete: false, exitCode: -1, rawTrace: sealedTrace });
         reject(error);
       });
       proc.on("close", (code) => {
@@ -1591,6 +1893,25 @@ export default function (pi: ExtensionAPI) {
         const exitCode = code ?? 0;
         appendDelegationTraceEvent(trace, { type: "process_exit", exitCode });
         const sealedTrace = sealDelegationTrace(trace, cwd, exitCode, exitCode === 0);
+        for (const file of sealedTrace.changedFiles) {
+          emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+            eventType: "file_changed",
+            title: file.path,
+            detail: file.status,
+            metadata: { ...file },
+          });
+        }
+        emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+          eventType: exitCode === 0 ? "agent_completed" : "agent_failed",
+          title: `${agentName} ${exitCode === 0 ? "completed" : "failed"}`,
+          metadata: { exitCode, changedFileCount: sealedTrace.changedFiles.length },
+        });
+        emitAgentRunTraceEvent(agentRunTrace, onUpdate, {
+          eventType: "delegation_completed",
+          title: `Delegation to ${agentName} ${exitCode === 0 ? "completed" : "failed"}`,
+          metadata: { exitCode, trace: sealedTrace },
+        });
+        sealAgentRunTrace(agentRunTrace, { complete: exitCode === 0, exitCode, rawTrace: sealedTrace });
         resolvePromise({ output: finalOutput || stdout.trim() || "(no output)", stderr, exitCode, trace: sealedTrace });
       });
 
@@ -1617,7 +1938,7 @@ export default function (pi: ExtensionAPI) {
       task: Type.String({ description: "Task description for the delegated agent" }),
       cwd: Type.Optional(Type.String({ description: "Working directory for the delegated pi process" })),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       setCwd(ctx);
       refreshResources();
       refreshActiveStateFromDisk();
@@ -1656,7 +1977,7 @@ export default function (pi: ExtensionAPI) {
 
       let result: { output: string; stderr: string; exitCode: number; trace: DelegationTraceResult };
       try {
-        result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, parentAgent, signal, ctx);
+        result = await runDelegatedAgent(params.agent, params.task, params.cwd || ctx.cwd || currentCwd, parentAgent, signal, onUpdate, ctx);
       } catch (error) {
         restoreParentAgent();
         if (delegateActivity) {

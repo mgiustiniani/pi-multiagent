@@ -119,6 +119,15 @@ The extension merges all registries dynamically.
 
 When a workflow is activated, the extension snapshots the currently selected provider/model and thinking level for that activation. Parent turns re-apply that snapshot before agent execution, and `delegate_agent` starts child pi processes with the same locked model flags. This prevents model changes in another pi instance, or later global/default model changes, from changing the model used by an already-active workflow. To intentionally use a different model, deactivate and activate the workflow again after selecting the desired model.
 
+## Delegation Traces
+
+Every `delegate_agent` call records two trace layers:
+
+- raw sealed training trajectories under `~/.pi/agent/trajectories` by default (override with `MULTI_AGENT_TRAJECTORY_DIR`);
+- IDE-friendly trace events under `<workspace>/.ide/agent-runs/<run-id>/trace.jsonl` by default (override with `MULTI_AGENT_IDE_TRACE_DIR`, disable with `MULTI_AGENT_IDE_TRACE=0`).
+
+Raw trajectories tee the child `pi --mode json` event stream, exclude thinking/reasoning fields, include prompt/tool/model fingerprints, and are sealed with SHA-256 metadata. IDE traces contain sanitized operational events for agent panels and file-change history: `delegation_started`, `agent_started`, `tool_started`, `tool_completed`, `file_changed`, `agent_completed`, and `delegation_completed`.
+
 ## Extension
 
 Load the extension to enable the status panel, validator, project-local workflow state, and `delegate_agent`:

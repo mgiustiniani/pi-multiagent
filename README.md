@@ -13,6 +13,8 @@ It provides:
 - generic C4/Structurizr tooling used by `c4model`;
 - a validator/runtime extension with `delegate_agent`;
 - a TUI status panel extension;
+- raw sealed delegation trajectories for training capture;
+- IDE-friendly agent-run trace JSONL for live visibility/history;
 - a generic capability registry that workflow packs can extend.
 
 It does **not** include Java-, Tauri-, or native C/C++/Objective-C-specific implementation agents or workflows. Install workflow packs after installing this base skill. Shared frontend agents live in the base skill so multiple packs can reuse the same JavaScript/TypeScript frontend workflow roles.
@@ -97,6 +99,15 @@ The TUI widget is split into two side-by-side blocks on wide terminals:
 The activity block is UI-only metadata. It does not stream child-agent tool output into the main model context.
 
 On narrow terminals the blocks stack vertically.
+
+## Delegation traces
+
+Every `delegate_agent` call writes two trace layers:
+
+- raw sealed training trajectories under `~/.pi/agent/trajectories` by default (override with `MULTI_AGENT_TRAJECTORY_DIR`);
+- IDE-friendly trace events under `<workspace>/.ide/agent-runs/<run-id>/trace.jsonl` by default (override with `MULTI_AGENT_IDE_TRACE_DIR`, disable with `MULTI_AGENT_IDE_TRACE=0`).
+
+Raw trajectories tee the child `pi --mode json` event stream, exclude thinking/reasoning fields, and are sealed with SHA-256 metadata. IDE traces are sanitized operational events (`delegation_started`, `agent_started`, `tool_started`, `tool_completed`, `file_changed`, `agent_completed`, `delegation_completed`) intended for agent activity panes and file-change history.
 
 ## Shared frontend agents
 
